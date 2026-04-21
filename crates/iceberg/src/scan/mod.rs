@@ -454,10 +454,7 @@ impl TableScan {
     /// each [`FileScanTask::predicate`] at planning time and are not
     /// re-applied here. Using tasks from a scan with a different projection
     /// or filter yields undefined behavior.
-    pub fn to_arrow_with_tasks(
-        &self,
-        tasks: FileScanTaskStream,
-    ) -> Result<ArrowRecordBatchStream> {
+    pub fn to_arrow_with_tasks(&self, tasks: FileScanTaskStream) -> Result<ArrowRecordBatchStream> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
