@@ -461,6 +461,7 @@ mod tests {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -681,6 +682,7 @@ mod tests {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -895,6 +897,7 @@ mod tests {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();

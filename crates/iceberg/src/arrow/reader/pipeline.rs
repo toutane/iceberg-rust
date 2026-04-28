@@ -21,6 +21,7 @@
 //! of transformed Arrow `RecordBatch`es.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -33,8 +34,9 @@ use super::{
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
-use crate::io::{FileIO, FileMetadata};
+use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::Datum;
@@ -42,32 +44,28 @@ use crate::{Error, ErrorKind};
 
 impl ArrowReader {
     /// Take a stream of FileScanTasks and reads all the files.
-    /// Returns a stream of Arrow RecordBatches containing the data from the files
-    pub fn read(self, tasks: FileScanTaskStream) -> Result<ArrowRecordBatchStream> {
-        let file_io = self.file_io.clone();
-        let batch_size = self.batch_size;
+    /// Returns a [`ScanResult`] containing the record batch stream and scan metrics.
+    pub fn read(self, tasks: FileScanTaskStream) -> Result<ScanResult> {
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
-        let row_group_filtering_enabled = self.row_group_filtering_enabled;
-        let row_selection_enabled = self.row_selection_enabled;
-        let parquet_read_options = self.parquet_read_options;
+        let scan_metrics = ScanMetrics::new();
+
+        let task_reader = FileScanTaskReader {
+            batch_size: self.batch_size,
+            file_io: self.file_io,
+            delete_file_loader: self
+                .delete_file_loader
+                .with_scan_metrics(scan_metrics.clone()),
+            row_group_filtering_enabled: self.row_group_filtering_enabled,
+            row_selection_enabled: self.row_selection_enabled,
+            parquet_read_options: self.parquet_read_options,
+            scan_metrics: scan_metrics.clone(),
+        };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
             Box::pin(
                 tasks
-                    .and_then(move |task| {
-                        let file_io = file_io.clone();
-
-                        Self::process_file_scan_task(
-                            task,
-                            batch_size,
-                            file_io,
-                            self.delete_file_loader.clone(),
-                            row_group_filtering_enabled,
-                            row_selection_enabled,
-                            parquet_read_options,
-                        )
-                    })
+                    .and_then(move |task| task_reader.clone().process(task))
                     .map_err(|err| {
                         Error::new(ErrorKind::Unexpected, "file scan task generate failed")
                             .with_source(err)
@@ -77,19 +75,7 @@ impl ArrowReader {
         } else {
             Box::pin(
                 tasks
-                    .map_ok(move |task| {
-                        let file_io = file_io.clone();
-
-                        Self::process_file_scan_task(
-                            task,
-                            batch_size,
-                            file_io,
-                            self.delete_file_loader.clone(),
-                            row_group_filtering_enabled,
-                            row_selection_enabled,
-                            parquet_read_options,
-                        )
-                    })
+                    .map_ok(move |task| task_reader.clone().process(task))
                     .map_err(|err| {
                         Error::new(ErrorKind::Unexpected, "file scan task generate failed")
                             .with_source(err)
@@ -99,32 +85,41 @@ impl ArrowReader {
             )
         };
 
-        Ok(stream)
+        Ok(ScanResult::new(stream, scan_metrics))
     }
+}
 
-    async fn process_file_scan_task(
-        task: FileScanTask,
-        batch_size: Option<usize>,
-        file_io: FileIO,
-        delete_file_loader: CachingDeleteFileLoader,
-        row_group_filtering_enabled: bool,
-        row_selection_enabled: bool,
-        parquet_read_options: ParquetReadOptions,
-    ) -> Result<ArrowRecordBatchStream> {
+/// Per-scan state for processing [`FileScanTask`]s. Created once per
+/// [`ArrowReader::read`] call and cloned per task.
+#[derive(Clone)]
+struct FileScanTaskReader {
+    batch_size: Option<usize>,
+    file_io: FileIO,
+    delete_file_loader: CachingDeleteFileLoader,
+    row_group_filtering_enabled: bool,
+    row_selection_enabled: bool,
+    parquet_read_options: ParquetReadOptions,
+    scan_metrics: ScanMetrics,
+}
+
+impl FileScanTaskReader {
+    async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
-            (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
-        let mut parquet_read_options = parquet_read_options;
+            (self.row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
+        let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
-        let delete_filter_rx =
-            delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
+        let delete_filter_rx = self
+            .delete_file_loader
+            .load_deletes(&task.deletes, Arc::clone(&task.schema));
 
         // Open the Parquet file once, loading its metadata
-        let (parquet_file_reader, arrow_metadata) = Self::open_parquet_file(
+        let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
             &task.data_file_path,
-            &file_io,
+            &self.file_io,
             task.file_size_in_bytes,
             parquet_read_options,
+            self.scan_metrics.bytes_read_counter(),
         )
         .await?;
 
@@ -222,7 +217,7 @@ impl ArrowReader {
         // - If file has embedded IDs: field-ID-based projection (missing_field_ids=false)
         // - If name mapping applied: field-ID-based projection (missing_field_ids=true but IDs now match)
         // - If fallback IDs: position-based projection (missing_field_ids=true)
-        let projection_mask = Self::get_arrow_projection_mask(
+        let projection_mask = ArrowReader::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
@@ -255,7 +250,7 @@ impl ArrowReader {
 
         let mut record_batch_transformer = record_batch_transformer_builder.build();
 
-        if let Some(batch_size) = batch_size {
+        if let Some(batch_size) = self.batch_size {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
@@ -296,7 +291,7 @@ impl ArrowReader {
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
         if task.start != 0 || task.length != 0 {
-            let byte_range_filtered_row_groups = Self::filter_row_groups_by_byte_range(
+            let byte_range_filtered_row_groups = ArrowReader::filter_row_groups_by_byte_range(
                 record_batch_stream_builder.metadata(),
                 task.start,
                 task.length,
@@ -305,12 +300,12 @@ impl ArrowReader {
         }
 
         if let Some(predicate) = final_predicate {
-            let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
+            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 &predicate,
             )?;
 
-            let row_filter = Self::get_row_filter(
+            let row_filter = ArrowReader::get_row_filter(
                 &predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
@@ -318,8 +313,8 @@ impl ArrowReader {
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
-            if row_group_filtering_enabled {
-                let predicate_filtered_row_groups = Self::get_selected_row_group_indices(
+            if self.row_group_filtering_enabled {
+                let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &field_id_map,
@@ -341,8 +336,8 @@ impl ArrowReader {
                 };
             }
 
-            if row_selection_enabled {
-                row_selection = Some(Self::get_row_selection_for_filter_predicate(
+            if self.row_selection_enabled {
+                row_selection = Some(ArrowReader::get_row_selection_for_filter_predicate(
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
@@ -358,7 +353,7 @@ impl ArrowReader {
             let delete_row_selection = {
                 let positional_delete_indexes = positional_delete_indexes.lock().unwrap();
 
-                Self::build_deletes_row_selection(
+                ArrowReader::build_deletes_row_selection(
                     record_batch_stream_builder.metadata().row_groups(),
                     &selected_row_group_indices,
                     &positional_delete_indexes,
@@ -400,18 +395,34 @@ impl ArrowReader {
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
+}
 
-    /// Opens a Parquet file and loads its metadata, returning both the reader and metadata.
-    /// The reader can be reused to build a `ParquetRecordBatchStreamBuilder` without
-    /// reopening the file.
+impl ArrowReader {
+    /// Opens a Parquet file and loads its metadata, wrapping the reader with
+    /// [`CountingFileRead`] so all I/O is accumulated into `bytes_read`.
     pub(crate) async fn open_parquet_file(
         data_file_path: &str,
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
+        bytes_read: &Arc<AtomicU64>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
-        let parquet_reader = parquet_file.reader().await?;
+        let counting_reader =
+            CountingFileRead::new(parquet_file.reader().await?, Arc::clone(bytes_read));
+        Self::build_parquet_reader(
+            Box::new(counting_reader),
+            file_size_in_bytes,
+            parquet_read_options,
+        )
+        .await
+    }
+
+    async fn build_parquet_reader(
+        parquet_reader: Box<dyn FileRead>,
+        file_size_in_bytes: u64,
+        parquet_read_options: ParquetReadOptions,
+    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let mut reader = ArrowFileReader::new(
             FileMetadata {
                 size: file_size_in_bytes,
@@ -497,7 +508,13 @@ mod tests {
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        reader.read(tasks).unwrap().try_collect().await.unwrap()
+        reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap()
     }
 
     // ArrowWriter cannot write INT96, so we use SerializedFileWriter directly.
@@ -748,6 +765,7 @@ mod tests {
         let result = reader
             .read(tasks_stream)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();

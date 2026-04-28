@@ -602,6 +602,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -704,6 +705,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -805,6 +807,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -895,6 +898,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -999,6 +1003,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -1132,6 +1137,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -1232,6 +1238,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -1346,6 +1353,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -1488,6 +1496,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
@@ -1699,6 +1708,7 @@ message schema {
         let result = reader
             .read(tasks)
             .unwrap()
+            .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
