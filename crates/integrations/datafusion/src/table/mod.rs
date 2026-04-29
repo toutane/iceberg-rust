@@ -43,9 +43,8 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
@@ -937,8 +936,8 @@ mod tests {
 
     // ── Bucketed scan tests ──────────────────────────────────────────────────
 
-    async fn make_catalog_and_table_for_bucketing(
-    ) -> (Arc<dyn Catalog>, NamespaceIdent, String, tempfile::TempDir) {
+    async fn make_catalog_and_table_for_bucketing()
+    -> (Arc<dyn Catalog>, NamespaceIdent, String, tempfile::TempDir) {
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use iceberg::{CatalogBuilder, TableCreation};
@@ -1054,10 +1053,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(8).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan
-            .as_any()
-            .downcast_ref::<IcebergTableScan>()
-            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         assert_eq!(scan.buckets().len(), 1);
         assert_eq!(scan.buckets()[0].len(), 0);
@@ -1083,10 +1079,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan
-            .as_any()
-            .downcast_ref::<IcebergTableScan>()
-            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         let total_files: usize = scan.buckets().iter().map(|b| b.len()).sum();
         assert_eq!(total_files, 5);
@@ -1113,10 +1106,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(16).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan
-            .as_any()
-            .downcast_ref::<IcebergTableScan>()
-            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         assert_eq!(scan.buckets().len(), 2);
     }
@@ -1136,17 +1126,14 @@ mod tests {
             .scan(&ctx_with_target_partitions(1).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan
-            .as_any()
-            .downcast_ref::<IcebergTableScan>()
-            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         assert_eq!(scan.buckets().len(), 1);
         assert_eq!(scan.buckets()[0].len(), 4);
     }
 
-    async fn make_partitioned_catalog_and_table_for_bucketing(
-    ) -> (Arc<dyn Catalog>, NamespaceIdent, String, tempfile::TempDir) {
+    async fn make_partitioned_catalog_and_table_for_bucketing()
+    -> (Arc<dyn Catalog>, NamespaceIdent, String, tempfile::TempDir) {
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
             NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
@@ -1215,9 +1202,7 @@ mod tests {
         table_name: &str,
         partition_values: Vec<&str>,
     ) {
-        use iceberg::spec::{
-            DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct,
-        };
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
         use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
         let table = catalog
@@ -1264,12 +1249,9 @@ mod tests {
 
         let (catalog, namespace, table_name, _temp_dir) =
             make_partitioned_catalog_and_table_for_bucketing().await;
-        append_partitioned_fake_data_files(
-            &catalog,
-            &namespace,
-            &table_name,
-            vec!["a", "b", "c", "a", "b", "c"],
-        )
+        append_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec![
+            "a", "b", "c", "a", "b", "c",
+        ])
         .await;
 
         let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
@@ -1279,10 +1261,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan
-            .as_any()
-            .downcast_ref::<IcebergTableScan>()
-            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         let total_files: usize = scan.buckets().iter().map(|b| b.len()).sum();
         assert_eq!(total_files, 6);
@@ -1309,13 +1288,7 @@ mod tests {
 
         let (catalog, namespace, table_name, _temp_dir) =
             make_partitioned_catalog_and_table_for_bucketing().await;
-        append_partitioned_fake_data_files(
-            &catalog,
-            &namespace,
-            &table_name,
-            vec!["a", "b"],
-        )
-        .await;
+        append_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec!["a", "b"]).await;
 
         let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
             .await
@@ -1331,15 +1304,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let scan = plan
-            .as_any()
-            .downcast_ref::<IcebergTableScan>()
-            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         assert!(matches!(
             scan.properties().partitioning,
             Partitioning::UnknownPartitioning(_)
         ));
     }
-
 }
