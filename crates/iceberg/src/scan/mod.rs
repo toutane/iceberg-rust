@@ -457,7 +457,7 @@ impl TableScan {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
 
-        arrow_reader_builder.build().read(tasks)
+        arrow_reader_builder.build().read(tasks).map(|r| r.stream())
     }
 
     /// Returns a reference to the column names of the table scan.
