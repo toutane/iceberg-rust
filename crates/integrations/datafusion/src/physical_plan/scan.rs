@@ -18,11 +18,10 @@
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::vec;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -31,33 +30,45 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProp
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
+use iceberg::scan::{FileScanTask, TableScan};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
-/// Manages the scanning process of an Iceberg [`Table`], encapsulating the
-/// necessary details and computed properties required for execution planning.
+/// Iceberg [`Table`] scan as a DataFusion [`ExecutionPlan`].
+///
+/// Has two construction modes: [`IcebergTableScan::new`] for a lazy
+/// single-partition scan, and [`IcebergTableScan::new_with_tasks`] for an
+/// eager multi-partition scan over pre-planned [`FileScanTask`] buckets.
+///
+/// Note: in eager mode the underlying `TableScan` is rebuilt on every
+/// `execute(partition)` call. The per-build cost is bounded (no I/O) and
+/// keeps the plan free of `Arc`-shared evaluator caches that are awkward to
+/// serialize across workers.
 #[derive(Debug)]
 pub struct IcebergTableScan {
     /// A table in the catalog.
     table: Table,
     /// Snapshot of the table to scan.
     snapshot_id: Option<i64>,
-    /// Stores certain, often expensive to compute,
-    /// plan properties used in query optimization.
+    /// Cached plan properties used by query optimization.
     plan_properties: Arc<PlanProperties>,
-    /// Projection column names, None means all columns
+    /// Projection column names, None means all columns.
     projection: Option<Vec<String>>,
-    /// Filters to apply to the table scan
+    /// Filters to apply to the table scan.
     predicates: Option<Predicate>,
-    /// Optional limit on the number of rows to return
+    /// Pre-planned file scan tasks per partition (eager mode), or `None` (lazy mode).
+    buckets: Option<Vec<Vec<FileScanTask>>>,
+    /// Optional limit on the number of rows to return.
     limit: Option<usize>,
 }
 
 impl IcebergTableScan {
-    /// Creates a new [`IcebergTableScan`] object.
-    pub(crate) fn new(
+    /// Creates a lazy single-partition scan that plans and reads all tasks
+    /// inside `execute(0)`. Used by
+    /// [`IcebergStaticTableProvider`][crate::table::IcebergStaticTableProvider].
+    pub fn new(
         table: Table,
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
@@ -65,12 +76,67 @@ impl IcebergTableScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Self {
+        Self::new_inner(
+            table,
+            snapshot_id,
+            schema,
+            projection,
+            filters,
+            limit,
+            Partitioning::UnknownPartitioning(1),
+            None,
+        )
+    }
+
+    /// Creates an eager multi-partition scan over pre-planned task buckets.
+    /// Partition `i` streams `buckets[i]`. The caller is responsible for
+    /// ensuring `partitioning` matches the bucketing. Used by
+    /// [`IcebergTableProvider`][crate::table::IcebergTableProvider].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tasks(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        buckets: Vec<Vec<FileScanTask>>,
+        partitioning: Partitioning,
+    ) -> Self {
+        Self::new_inner(
+            table,
+            snapshot_id,
+            schema,
+            projection,
+            filters,
+            limit,
+            partitioning,
+            Some(buckets),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        partitioning: Partitioning,
+        buckets: Option<Vec<Vec<FileScanTask>>>,
+    ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
             Some(projection) => Arc::new(schema.project(projection).unwrap()),
         };
-        let plan_properties = Self::compute_properties(output_schema.clone());
-        let projection = get_column_names(schema.clone(), projection);
+        let plan_properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(output_schema),
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        let projection = get_column_names(schema, projection);
         let predicates = convert_filters_to_predicate(filters);
 
         Self {
@@ -79,6 +145,7 @@ impl IcebergTableScan {
             plan_properties,
             projection,
             predicates,
+            buckets,
             limit,
         }
     }
@@ -99,21 +166,17 @@ impl IcebergTableScan {
         self.predicates.as_ref()
     }
 
+    /// Returns the pre-planned file task buckets, or an empty slice in lazy mode.
+    pub fn buckets(&self) -> &[Vec<FileScanTask>] {
+        self.buckets.as_deref().unwrap_or(&[])
+    }
+
     pub fn limit(&self) -> Option<usize> {
         self.limit
     }
 
-    /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef) -> Arc<PlanProperties> {
-        // TODO:
-        // This is more or less a placeholder, to be replaced
-        // once we support output-partitioning
-        Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ))
+    fn total_file_count(&self) -> usize {
+        self.buckets().iter().map(|b| b.len()).sum()
     }
 }
 
@@ -132,8 +195,15 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Internal(format!(
+                "{} is a leaf node and expects no children, but {} were provided",
+                self.name(),
+                children.len()
+            )));
+        }
         Ok(self)
     }
 
@@ -143,36 +213,34 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
+        let bucket = match &self.buckets {
+            Some(buckets) => Some(buckets.get(partition).cloned().ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "{}: partition index {partition} is out of bounds (total buckets: {})",
+                    self.name(),
+                    buckets.len()
+                ))
+            })?),
+            None => None,
+        };
+
+        let fut = build_record_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             self.projection.clone(),
             self.predicates.clone(),
+            bucket,
         );
-        let stream = futures::stream::once(fut).try_flatten();
+        let stream = Box::pin(futures::stream::once(fut).try_flatten())
+            as Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>;
 
-        // Apply limit if specified
-        let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-            if let Some(limit) = self.limit {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
+        let limited_stream = match self.limit {
+            Some(limit) => apply_limit(stream, limit),
+            None => stream,
+        };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -187,16 +255,25 @@ impl DisplayAs for IcebergTableScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
+        let projection = self
+            .projection
+            .as_deref()
+            .map_or(String::new(), |v| v.join(","));
+        let predicate = self
+            .predicates
+            .as_ref()
+            .map_or(String::new(), |p| p.to_string());
+
         write!(
             f,
-            "IcebergTableScan projection:[{}] predicate:[{}]",
-            self.projection
-                .clone()
-                .map_or(String::new(), |v| v.join(",")),
-            self.predicates
-                .clone()
-                .map_or(String::from(""), |p| format!("{p}"))
+            "{} projection:[{projection}] predicate:[{predicate}]",
+            self.name()
         )?;
+        if let Some(buckets) = &self.buckets {
+            let file_count = self.total_file_count();
+            let bucket_count = buckets.len();
+            write!(f, " buckets:[{bucket_count}] file_count:[{file_count}]")?;
+        }
         if let Some(limit) = self.limit {
             write!(f, " limit:[{limit}]")?;
         }
@@ -204,40 +281,81 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
+fn build_table_scan(
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
-) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+) -> DFResult<TableScan> {
     let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
+        Some(id) => table.scan().snapshot_id(id),
         None => table.scan(),
     };
-
     let mut scan_builder = match column_names {
-        Some(column_names) => scan_builder.select(column_names),
+        Some(names) => scan_builder.select(names),
         None => scan_builder.select_all(),
     };
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
-
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
+    scan_builder.build().map_err(to_datafusion_error)
 }
 
-fn get_column_names(
+/// Builds the `RecordBatch` stream for a single partition. When `bucket` is
+/// `Some`, streams the pre-planned tasks via `to_arrow_from_tasks`; when
+/// `None`, plans and reads the full scan via `to_arrow`.
+async fn build_record_batch_stream(
+    table: Table,
+    snapshot_id: Option<i64>,
+    column_names: Option<Vec<String>>,
+    predicates: Option<Predicate>,
+    bucket: Option<Vec<FileScanTask>>,
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let table_scan = build_table_scan(table, snapshot_id, column_names, predicates)?;
+    let stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> = match bucket {
+        Some(bucket) => {
+            let task_stream = Box::pin(futures::stream::iter(
+                bucket.into_iter().map(Ok::<_, iceberg::Error>),
+            ));
+            Box::pin(
+                table_scan
+                    .to_arrow_from_tasks(task_stream)
+                    .map_err(to_datafusion_error)?
+                    .map_err(to_datafusion_error),
+            )
+        }
+        None => Box::pin(
+            table_scan
+                .to_arrow()
+                .await
+                .map_err(to_datafusion_error)?
+                .map_err(to_datafusion_error),
+        ),
+    };
+    Ok(stream)
+}
+
+/// Truncates a stream of `RecordBatch` to at most `limit` rows.
+fn apply_limit(
+    stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+    limit: usize,
+) -> Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> {
+    let mut remaining = limit;
+    Box::pin(stream.try_filter_map(move |batch| {
+        futures::future::ready(if remaining == 0 {
+            Ok(None)
+        } else if batch.num_rows() <= remaining {
+            remaining -= batch.num_rows();
+            Ok(Some(batch))
+        } else {
+            let limited_batch = batch.slice(0, remaining);
+            remaining = 0;
+            Ok(Some(limited_batch))
+        })
+    }))
+}
+
+pub(super) fn get_column_names(
     schema: ArrowSchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> Option<Vec<String>> {

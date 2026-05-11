@@ -462,6 +462,21 @@ impl TableScan {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
+        self.to_arrow_from_tasks(self.plan_files().await?)
+    }
+
+    /// Like [`TableScan::to_arrow`], but accepts a caller-supplied
+    /// [`FileScanTask`] stream instead of running [`TableScan::plan_files`]
+    /// internally.
+    ///
+    /// # Correctness
+    ///
+    /// Tasks must come from a [`TableScan`] with the same projection and
+    /// filter as `self`: predicates are baked into each task at planning
+    /// time and are not re-applied here. Reader-side configuration
+    /// (concurrency, batch size, row-group filtering, row selection) is
+    /// taken from `self` and may differ from the planning scan.
+    pub fn to_arrow_from_tasks(&self, tasks: FileScanTaskStream) -> Result<ArrowRecordBatchStream> {
         let mut arrow_reader_builder =
             ArrowReaderBuilder::new(self.file_io.clone(), self.runtime.clone())
                 .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
@@ -472,10 +487,7 @@ impl TableScan {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
 
-        arrow_reader_builder
-            .build()
-            .read(self.plan_files().await?)
-            .map(|result| result.stream())
+        arrow_reader_builder.build().read(tasks).map(|r| r.stream())
     }
 
     /// Returns a reference to the column names of the table scan.
