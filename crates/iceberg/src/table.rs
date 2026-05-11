@@ -23,6 +23,7 @@ use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
+use crate::runtime::Runtime;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
@@ -36,6 +37,7 @@ pub struct TableBuilder {
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
+    runtime: Option<Runtime>,
 }
 
 impl TableBuilder {
@@ -48,6 +50,7 @@ impl TableBuilder {
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
+            runtime: None,
         }
     }
 
@@ -95,6 +98,12 @@ impl TableBuilder {
         self
     }
 
+    /// Set the Runtime for this table to use when spawning tasks.
+    pub fn runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     /// build the Table
     pub fn build(self) -> Result<Table> {
         let Self {
@@ -105,6 +114,7 @@ impl TableBuilder {
             readonly,
             disable_cache,
             cache_size_bytes,
+            runtime,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -146,6 +156,7 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            runtime,
         })
     }
 }
@@ -159,6 +170,9 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    /// Runtime explicitly attached at build time. `None` means "resolve from
+    /// the ambient tokio runtime on demand"
+    runtime: Option<Runtime>,
 }
 
 impl Table {
@@ -230,6 +244,15 @@ impl Table {
         MetadataTable::new(self)
     }
 
+    /// Returns a resolved [`Runtime`] for this table.
+    ///
+    /// If a runtime was set via [`TableBuilder::runtime`], it is returned.
+    /// Otherwise, this borrows the ambient tokio runtime via
+    /// [`Runtime::current`], which panics if called outside a tokio context.
+    pub(crate) fn runtime(&self) -> Runtime {
+        self.runtime.clone().unwrap_or_else(Runtime::current)
+    }
+
     /// Returns the flag indicating whether the `Table` is readonly or not
     pub fn readonly(&self) -> bool {
         self.readonly
@@ -241,8 +264,11 @@ impl Table {
     }
 
     /// Create a reader for the table.
+    ///
+    /// Requires that a [`Runtime`] was set on the builder or that this is
+    /// called from within a tokio runtime context; panics otherwise.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.file_io.clone())
+        ArrowReaderBuilder::new(self.file_io.clone(), self.runtime())
     }
 }
 
@@ -326,7 +352,7 @@ impl StaticTable {
 
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.0.file_io.clone())
+        self.0.reader_builder()
     }
 }
 
