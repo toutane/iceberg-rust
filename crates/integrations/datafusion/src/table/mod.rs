@@ -51,7 +51,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::TableProperties;
 use iceberg::table::Table;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, Runtime, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
@@ -71,6 +71,10 @@ use crate::physical_plan::write::IcebergWriteExec;
 ///
 /// For read-only access to a specific snapshot without catalog overhead, use
 /// [`IcebergStaticTableProvider`] instead.
+///
+/// When using a CPU/IO split runtime, pass a [`Runtime`] via
+/// [`Self::try_new_with_runtime`] so that catalog IO is dispatched to the IO
+/// runtime rather than running on the caller's runtime.
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// The catalog that manages this table
@@ -79,6 +83,8 @@ pub struct IcebergTableProvider {
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
     schema: ArrowSchemaRef,
+    /// When `Some`, IO in `scan` and `insert_into` is spawned on `runtime.io()`.
+    runtime: Option<Runtime>,
 }
 
 impl IcebergTableProvider {
@@ -91,6 +97,17 @@ impl IcebergTableProvider {
         namespace: NamespaceIdent,
         name: impl Into<String>,
     ) -> Result<Self> {
+        Self::try_new_with_runtime(catalog, namespace, name, None).await
+    }
+
+    /// Like [`Self::try_new`], but routes catalog IO in `scan` and `insert_into`
+    /// through `runtime.io()` instead of running inline on the caller's runtime.
+    pub async fn try_new_with_runtime(
+        catalog: Arc<dyn Catalog>,
+        namespace: NamespaceIdent,
+        name: impl Into<String>,
+        runtime: Option<Runtime>,
+    ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
 
         let table = catalog.load_table(&table_ident).await?;
@@ -100,7 +117,23 @@ impl IcebergTableProvider {
             catalog,
             table_ident,
             schema,
+            runtime,
         })
+    }
+
+    /// Runs `fut` on `self.runtime.io()` if set, otherwise runs it inline.
+    async fn run_on_io<F, T>(&self, fut: F) -> DFResult<T>
+    where
+        F: std::future::Future<Output = DFResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.runtime {
+            Some(rt) => match rt.io().spawn(fut).await {
+                Ok(inner) => inner,
+                Err(e) => Err(to_datafusion_error(e)),
+            },
+            None => fut.await,
+        }
     }
 
     pub(crate) async fn metadata_table(
@@ -133,43 +166,58 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Second load: fetch the latest snapshot so scans always reflect current table state.
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
-
-        // Build a TableScan mirroring the inputs we'll hand to IcebergTableScan,
-        // so plan_files() uses the same projection/filters the scan will replay in execute().
-        let col_names = projection.map(|indices| {
-            indices
-                .iter()
-                .map(|&i| self.schema.field(i).name().clone())
-                .collect::<Vec<_>>()
-        });
-
+        // Compute the predicate on the caller's runtime (pure CPU, no IO).
         let predicate = convert_filters_to_predicate(filters);
 
-        let mut builder = table.scan();
-        builder = match col_names {
-            Some(names) => builder.select(names),
-            None => builder.select_all(),
-        };
-        if let Some(pred) = predicate {
-            builder = builder.with_filter(pred);
-        }
+        // Capture everything the IO closure needs; Session is not Send.
+        let target_partitions = state.config().target_partitions();
+        let projection_owned: Option<Vec<usize>> = projection.cloned();
+        let catalog = self.catalog.clone();
+        let table_ident = self.table_ident.clone();
+        let arrow_schema = self.schema.clone();
 
-        let tasks: Vec<FileScanTask> = builder
-            .build()
-            .map_err(to_datafusion_error)?
-            .plan_files()
-            .await
-            .map_err(to_datafusion_error)?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(to_datafusion_error)?;
+        // ── IO-bound: reload table + plan files ──────────────────────────────
+        // Spawned on `self.runtime.io()` when configured, otherwise runs inline.
+        let (table, tasks) = self
+            .run_on_io(async move {
+                // Second load: fetch the latest snapshot so scans always reflect
+                // current table state.
+                let table = catalog
+                    .load_table(&table_ident)
+                    .await
+                    .map_err(to_datafusion_error)?;
 
+                let col_names = projection_owned.as_ref().map(|indices| {
+                    indices
+                        .iter()
+                        .map(|&i| arrow_schema.field(i).name().clone())
+                        .collect::<Vec<_>>()
+                });
+
+                let mut builder = table.scan();
+                builder = match col_names {
+                    Some(names) => builder.select(names),
+                    None => builder.select_all(),
+                };
+                if let Some(pred) = predicate {
+                    builder = builder.with_filter(pred);
+                }
+
+                let tasks: Vec<FileScanTask> = builder
+                    .build()
+                    .map_err(to_datafusion_error)?
+                    .plan_files()
+                    .await
+                    .map_err(to_datafusion_error)?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(to_datafusion_error)?;
+
+                DFResult::Ok((table, tasks))
+            })
+            .await?;
+
+        // ── CPU-bound: schema projection + bucketing ──────────────────────────
         // Output schema after projection: column indices in `Hash` exprs and any
         // Arrow array we hash must reference this schema, not the full table schema.
         let output_schema = match projection {
@@ -179,7 +227,6 @@ impl TableProvider for IcebergTableProvider {
             })?),
         };
 
-        let target_partitions = state.config().target_partitions();
         // Always produce at least 1 partition so that DataFusion can schedule
         // the plan normally and callers can safely call execute(0). An empty
         // bucket simply yields an empty record-batch stream.
@@ -232,11 +279,16 @@ impl TableProvider for IcebergTableProvider {
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let catalog = self.catalog.clone();
+        let table_ident = self.table_ident.clone();
         let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
+            .run_on_io(async move {
+                catalog
+                    .load_table(&table_ident)
+                    .await
+                    .map_err(to_datafusion_error)
+            })
+            .await?;
 
         let partition_spec = table.metadata().default_partition_spec();
 
