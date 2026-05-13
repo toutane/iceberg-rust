@@ -109,6 +109,10 @@ pub(super) struct BucketCol {
     /// Position of this column inside the partition spec's `fields()` slice,
     /// matching the slot order of `FileScanTask::partition`.
     pub(super) spec_field_idx: usize,
+    /// `N` parameter of the `Transform::Bucket(N)`. Used by [`bucket_tasks`]
+    /// to linearise multi-column bucket tuples deterministically before
+    /// projecting them on `n_partitions` via modulo.
+    pub(super) bucket_n: u32,
 }
 
 /// Inspect the table's default partition spec and return the list of bucket
@@ -136,15 +140,17 @@ pub(super) fn compute_bucket_cols(
 
     let mut cols = Vec::with_capacity(fields.len());
     for (spec_field_idx, pf) in fields.iter().enumerate() {
-        if !matches!(pf.transform, Transform::Bucket(_)) {
-            return None;
-        }
+        let bucket_n = match pf.transform {
+            Transform::Bucket(n) => n,
+            _ => return None,
+        };
         let source_field = table_schema.field_by_id(pf.source_id)?;
         let output_idx = output_schema.index_of(source_field.name.as_str()).ok()?;
         cols.push(BucketCol {
             name: source_field.name.clone(),
             output_idx,
             spec_field_idx,
+            bucket_n,
         });
     }
     Some(cols)
@@ -182,12 +188,21 @@ impl PartitionKeys {
 /// Why declaring `Hash` is correct for a pure-bucket spec even though the
 /// hash function differs from DataFusion's: DataFusion checks
 /// `Partitioning::Hash` against `Distribution::HashPartitioned` purely by
-/// expression equality, not by the underlying hash function. The contract to
+/// expression equality, not by the underlying hash function (see
+/// `datafusion_physical_expr::Partitioning::satisfaction`). The contract to
 /// honour is "rows with the same key tuple end up in the same partition",
 /// which Iceberg `bucket[N]` already guarantees at the file level (same
-/// source value implies same bucket index, hence same files), and our
-/// task-distribution preserves at the partition level by sending each
-/// unique bucket index to a single DataFusion partition.
+/// source value implies same bucket index, hence same files). Our task
+/// distribution preserves that property at the partition level by sending
+/// every unique bucket index (or bucket-index tuple, for multi-column
+/// specs) to a single DataFusion partition.
+///
+/// Crucially, this property does **not** require rehashing the bucket
+/// index: co-location is already a consequence of `bucket[N]` being
+/// deterministic on the source value. The scan therefore distributes tasks
+/// by linearising the bucket-index tuple and taking `% n_partitions`
+/// directly, which avoids birthday-paradox collisions in the common
+/// `N ≈ n_partitions` regime.
 pub(super) fn compute_partition_keys(
     table: &Table,
     output_schema: &ArrowSchema,
@@ -200,13 +215,30 @@ pub(super) fn compute_partition_keys(
     compute_bucket_cols(table, output_schema).map(PartitionKeys::Bucket)
 }
 
-/// Distribute `tasks` across `n_partitions` buckets. When `keys` describes a
-/// non-empty, hashable partition key (identity or bucket-index), each task is
-/// hashed on that key using DataFusion's repartition random state so the
-/// resulting partitioning satisfies the `Hash` contract at the row level.
-/// Tasks missing partition data fall back to hashing `data_file_path`, which
-/// still distributes evenly but breaks the `Hash` contract: the second tuple
-/// element flags whether every task supplied a full key.
+/// Distribute `tasks` across `n_partitions` slots. Two regimes coexist,
+/// driven by `keys`:
+///
+/// * `PartitionKeys::Identity` — each task is hashed on its identity
+///   partition values using [`REPARTITION_RANDOM_STATE`] and projected by
+///   `% n_partitions`. This is strictly aligned with what a downstream
+///   `RepartitionExec(Hash([id_col], n))` would compute, so the
+///   `Partitioning::Hash` annotation produced by `scan()` is honest at the
+///   row level and the planner can elide such a repartition.
+///
+/// * `PartitionKeys::Bucket` — each task is placed via positional
+///   linearisation of its bucket-index tuple, then `% n_partitions`. No
+///   hash is applied to the indices: Iceberg's `bucket[N]` is itself
+///   deterministic on the source value, so co-location of same-key rows
+///   is already guaranteed at the file level. Rehashing the indices would
+///   only add a uniform-spread layer that, in the common
+///   `N_total ≈ n_partitions` regime, produces birthday-paradox empty
+///   partitions. The deterministic modulo distributes the `N_1 * … * N_k`
+///   logical buckets evenly with a worst-case skew bounded to ±1 task.
+///
+/// Tasks missing partition data fall back to hashing `data_file_path`; the
+/// boolean returned alongside the buckets flags whether every task could
+/// supply a full key. A `false` flag forces the caller to drop to
+/// `UnknownPartitioning`.
 pub(super) fn bucket_tasks(
     tasks: Vec<FileScanTask>,
     n_partitions: usize,
@@ -219,23 +251,21 @@ pub(super) fn bucket_tasks(
     let mut all_full_key = true;
 
     for task in tasks {
-        let bucket_idx = match partition_hash(&task, keys) {
-            Some(h) => (h % n_partitions as u64) as usize,
-            None => {
-                all_full_key = false;
-                fallback_hash(&task) as usize % n_partitions
+        let dest = match keys {
+            Some(PartitionKeys::Identity(cols)) => {
+                identity_hash(&task, cols).map(|h| (h % n_partitions as u64) as usize)
             }
+            Some(PartitionKeys::Bucket(cols)) => bucket_linear_index(&task, cols)
+                .map(|linear| (linear % n_partitions as u64) as usize),
+            None => None,
         };
-        buckets[bucket_idx].push(task);
+        let dest = dest.unwrap_or_else(|| {
+            all_full_key = false;
+            fallback_hash(&task) as usize % n_partitions
+        });
+        buckets[dest].push(task);
     }
     (buckets, all_full_key)
-}
-
-fn partition_hash(task: &FileScanTask, keys: Option<&PartitionKeys>) -> Option<u64> {
-    match keys? {
-        PartitionKeys::Identity(cols) => identity_hash(task, cols),
-        PartitionKeys::Bucket(cols) => bucket_hash(task, cols),
-    }
 }
 
 /// Hash the identity-partition values of `task` using
@@ -252,34 +282,44 @@ fn identity_hash(task: &FileScanTask, cols: &[IdentityCol]) -> Option<u64> {
         let lit = partition.fields().get(col.spec_field_idx)?.as_ref()?;
         arrays.push(literal_to_array(lit, &col.output_dtype)?);
     }
-    hash_arrays(&arrays)
+    let mut hashes = vec![0u64; 1];
+    create_hashes(
+        &arrays,
+        REPARTITION_RANDOM_STATE.random_state(),
+        &mut hashes,
+    )
+    .ok()?;
+    Some(hashes[0])
 }
 
-/// Hash the bucket-index values stored in `task`'s partition tuple. The slot
-/// for a `Transform::Bucket(_)` field is always an `Int32` per the Iceberg
-/// spec, so we materialise it as `Int32Array` regardless of the source
-/// column's Arrow type.
-fn bucket_hash(task: &FileScanTask, cols: &[BucketCol]) -> Option<u64> {
+/// Linearise the bucket-index tuple of `task` into a single `u64` using a
+/// positional encoding `linear = ((idx_1 * N_2 * … * N_k) + … + idx_k)`.
+/// The slot for a `Transform::Bucket(_)` field is always `Int32` per the
+/// Iceberg spec; a missing slot or non-`Int` literal returns `None`,
+/// driving the caller's `all_full_key` flag to `false`.
+///
+/// For a single-column spec the formula reduces to `linear = idx_1`, so
+/// `dest = idx_1 % n_partitions` — the natural Iceberg distribution.
+fn bucket_linear_index(task: &FileScanTask, cols: &[BucketCol]) -> Option<u64> {
     if cols.is_empty() {
         return None;
     }
     let partition = task.partition.as_ref()?;
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
+    let mut linear: u64 = 0;
     for col in cols {
         let lit = partition.fields().get(col.spec_field_idx)?.as_ref()?;
         let idx = match lit {
             Literal::Primitive(PrimitiveLiteral::Int(v)) => *v,
             _ => return None,
         };
-        arrays.push(Arc::new(Int32Array::from(vec![idx])) as ArrayRef);
+        // `idx` is non-negative per the Iceberg spec (result of
+        // `bucket[N]` is in `[0, N)`); cast through `u32` first to avoid
+        // sign extension if the file accidentally carries a negative slot.
+        linear = linear
+            .wrapping_mul(col.bucket_n as u64)
+            .wrapping_add(idx as u32 as u64);
     }
-    hash_arrays(&arrays)
-}
-
-fn hash_arrays(arrays: &[ArrayRef]) -> Option<u64> {
-    let mut hashes = vec![0u64; 1];
-    create_hashes(arrays, REPARTITION_RANDOM_STATE.random_state(), &mut hashes).ok()?;
-    Some(hashes[0])
+    Some(linear)
 }
 
 /// Deterministic per-file fallback used when `identity_hash` cannot produce a
