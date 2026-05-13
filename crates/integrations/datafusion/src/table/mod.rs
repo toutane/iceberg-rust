@@ -1770,4 +1770,255 @@ mod tests {
             other => panic!("expected Partitioning::Hash, got {other:?}"),
         }
     }
+
+    /// Pure `Bucket[N]` with `target_partitions == N`: tasks must land
+    /// *deterministically* at `bucket_idx % n_partitions = bucket_idx`,
+    /// so every scan partition holds exactly one file and none is empty.
+    /// This is the regression test for the birthday-paradox empty
+    /// partitions observed in the original investigation
+    /// (`dd-notes/iceberg-bucket-rehash-investigation.md`).
+    #[tokio::test]
+    async fn test_bucket_n_eq_target_partitions_is_balanced() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            make_bucket_partitioned_catalog_and_table_for_bucketing(8).await;
+        // One file per bucket index 0..=7.
+        append_bucket_partitioned_fake_data_files(
+            &catalog,
+            &namespace,
+            &table_name,
+            (0..8).map(Some).collect(),
+        )
+        .await;
+
+        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let plan = provider
+            .scan(&ctx_with_target_partitions(8).state(), None, &[], None)
+            .await
+            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let buckets = scan.buckets();
+
+        assert_eq!(buckets.len(), 8);
+        for (partition_idx, files) in buckets.iter().enumerate() {
+            assert_eq!(
+                files.len(),
+                1,
+                "partition {partition_idx} should hold exactly one file"
+            );
+            // Each file's stored partition slot must equal its scan-partition
+            // index — the deterministic identity mapping when `N == n`.
+            let slot = files[0]
+                .partition
+                .as_ref()
+                .and_then(|s| s.fields().first().and_then(|f| f.clone()))
+                .expect("partition slot must be present");
+            let stored_idx = match slot {
+                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => v,
+                other => panic!("unexpected slot literal: {other:?}"),
+            };
+            assert_eq!(
+                stored_idx as usize, partition_idx,
+                "bucket idx must map to its own scan partition"
+            );
+        }
+    }
+
+    /// Pure `Bucket[N]` with `target_partitions < N`: tasks land at
+    /// `bucket_idx % target_partitions` deterministically.
+    #[tokio::test]
+    async fn test_bucket_n_gt_target_partitions_modulo_grouping() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            make_bucket_partitioned_catalog_and_table_for_bucketing(8).await;
+        append_bucket_partitioned_fake_data_files(
+            &catalog,
+            &namespace,
+            &table_name,
+            (0..8).map(Some).collect(),
+        )
+        .await;
+
+        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let plan = provider
+            .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
+            .await
+            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let buckets = scan.buckets();
+
+        assert_eq!(buckets.len(), 3);
+        // Expected grouping by `idx % 3`: {0,3,6} → p0, {1,4,7} → p1, {2,5} → p2.
+        let expected: [&[i32]; 3] = [&[0, 3, 6], &[1, 4, 7], &[2, 5]];
+        for (partition_idx, files) in buckets.iter().enumerate() {
+            let mut got: Vec<i32> = files
+                .iter()
+                .map(|t| {
+                    match t
+                        .partition
+                        .as_ref()
+                        .and_then(|s| s.fields().first().and_then(|f| f.clone()))
+                    {
+                        Some(iceberg::spec::Literal::Primitive(
+                            iceberg::spec::PrimitiveLiteral::Int(v),
+                        )) => v,
+                        other => panic!("unexpected slot: {other:?}"),
+                    }
+                })
+                .collect();
+            got.sort_unstable();
+            assert_eq!(
+                got,
+                expected[partition_idx].to_vec(),
+                "partition {partition_idx} grouping mismatch"
+            );
+        }
+    }
+
+    /// Multi-column pure-bucket spec: tasks are placed via the positional
+    /// linearisation `(idx_1 * N_2 + idx_2) % n_partitions`. Spec is
+    /// `bucket(2, name), bucket(4, id)`, target_partitions = 4.
+    #[tokio::test]
+    async fn test_bucket_multi_column_linearised_placement() {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
+            Schema, Struct, Transform, Type, UnboundPartitionSpec,
+        };
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{CatalogBuilder, TableCreation};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let warehouse = temp_dir.path().to_str().unwrap().to_string();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let namespace = NamespaceIdent::new("ns".to_string());
+        catalog
+            .create_namespace(&namespace, std::collections::HashMap::new())
+            .await
+            .unwrap();
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // First spec field buckets `name` into 2 slots, second buckets `id`
+        // into 4 slots. The linearisation is `idx_name * 4 + idx_id`.
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(2, "name_bucket", Transform::Bucket(2))
+            .unwrap()
+            .add_partition_field(1, "id_bucket", Transform::Bucket(4))
+            .unwrap()
+            .build();
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .location(format!("{warehouse}/t"))
+                    .schema(schema)
+                    .partition_spec(partition_spec)
+                    .properties(std::collections::HashMap::new())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = catalog
+            .load_table(&TableIdent::new(namespace.clone(), "t".to_string()))
+            .await
+            .unwrap();
+
+        // (name_idx, id_idx) → linear = name_idx * 4 + id_idx → dest = linear % 4
+        // (0,0) → 0 % 4 = 0
+        // (0,1) → 1 % 4 = 1
+        // (1,0) → 4 % 4 = 0
+        // (1,3) → 7 % 4 = 3
+        let tuples: [(i32, i32); 4] = [(0, 0), (0, 1), (1, 0), (1, 3)];
+        let data_files = tuples
+            .iter()
+            .enumerate()
+            .map(|(i, &(name_idx, id_idx))| {
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(format!(
+                        "{}/data/fake_{i}.parquet",
+                        table.metadata().location()
+                    ))
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(128)
+                    .record_count(1)
+                    .partition_spec_id(table.metadata().default_partition_spec_id())
+                    .partition(Struct::from_iter(vec![
+                        Some(Literal::int(name_idx)),
+                        Some(Literal::int(id_idx)),
+                    ]))
+                    .build()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let tx = Transaction::new(&table);
+        tx.fast_append()
+            .add_data_files(data_files)
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+
+        let provider = IcebergTableProvider::try_new(catalog, namespace, "t".to_string())
+            .await
+            .unwrap();
+        let plan = provider
+            .scan(&ctx_with_target_partitions(4).state(), None, &[], None)
+            .await
+            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let buckets = scan.buckets();
+
+        assert_eq!(buckets.len(), 4);
+
+        let read_tuple = |task: &iceberg::scan::FileScanTask| -> (i32, i32) {
+            let part = task.partition.as_ref().expect("partition tuple");
+            let name_idx = match part.fields()[0].as_ref().expect("name slot") {
+                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => *v,
+                _ => panic!("unexpected name slot"),
+            };
+            let id_idx = match part.fields()[1].as_ref().expect("id slot") {
+                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => *v,
+                _ => panic!("unexpected id slot"),
+            };
+            (name_idx, id_idx)
+        };
+
+        let mut p0: Vec<(i32, i32)> = buckets[0].iter().map(read_tuple).collect();
+        let p1: Vec<(i32, i32)> = buckets[1].iter().map(read_tuple).collect();
+        let p2: Vec<(i32, i32)> = buckets[2].iter().map(read_tuple).collect();
+        let p3: Vec<(i32, i32)> = buckets[3].iter().map(read_tuple).collect();
+
+        p0.sort_unstable();
+        assert_eq!(p0, vec![(0, 0), (1, 0)], "partition 0");
+        assert_eq!(p1, vec![(0, 1)], "partition 1");
+        assert!(p2.is_empty(), "partition 2 should be empty");
+        assert_eq!(p3, vec![(1, 3)], "partition 3");
+    }
 }
