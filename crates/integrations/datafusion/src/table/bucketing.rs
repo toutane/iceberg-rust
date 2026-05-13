@@ -115,11 +115,20 @@ pub(super) struct BucketCol {
     pub(super) bucket_n: u32,
 }
 
-/// Inspect the table's default partition spec and return the list of bucket
-/// columns when the spec is *purely* bucketed: every field must be a
-/// `Transform::Bucket(_)` and every source column must be present in the
-/// output projection. Returns `None` otherwise (mixed transforms, spec
-/// evolution, missing source column, or empty spec).
+/// Inspect the table's default partition spec and return the bucket columns
+/// usable for a [`Partitioning::Hash`] declaration. The spec must be
+/// *purely* bucketed (every field is a `Transform::Bucket(_)`); only the
+/// fields whose source column is present in the output projection are
+/// retained. Returns `None` on mixed transforms, spec evolution, empty
+/// spec, or when no bucket source column survives the projection.
+///
+/// Why a strict subset is still correct: `bucket[N]` is deterministic on
+/// the source value, so file-level co-location on any subset of bucket
+/// dimensions implies row-level co-location on that same subset. The
+/// positional linearisation in [`bucket_linear_index`] iterates over the
+/// retained `cols` only, indexing into `task.partition` via
+/// `spec_field_idx`, so dropping unused dimensions changes which slots are
+/// read but preserves "same key tuple → same partition".
 ///
 /// This deliberately rejects mixed identity+bucket specs: those are handled
 /// by [`compute_identity_cols`] which retains only the identity fields.
@@ -145,13 +154,18 @@ pub(super) fn compute_bucket_cols(
             _ => return None,
         };
         let source_field = table_schema.field_by_id(pf.source_id)?;
-        let output_idx = output_schema.index_of(source_field.name.as_str()).ok()?;
+        let Ok(output_idx) = output_schema.index_of(source_field.name.as_str()) else {
+            continue;
+        };
         cols.push(BucketCol {
             name: source_field.name.clone(),
             output_idx,
             spec_field_idx,
             bucket_n,
         });
+    }
+    if cols.is_empty() {
+        return None;
     }
     Some(cols)
 }
