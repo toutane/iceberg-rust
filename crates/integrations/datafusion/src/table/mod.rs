@@ -185,10 +185,11 @@ impl TableProvider for IcebergTableProvider {
 
         // `keys` is `Some` iff the table's default spec is hash-declarable:
         // either pure-identity (or mixed identity+bucket, in which case only
-        // the identity columns become the key) or pure-bucket. Any other
-        // shape (spec evolution, missing source column, mixed bucket+other
-        // transform, unsupported identity dtype) collapses to `None`, which
-        // forces `UnknownPartitioning` regardless of bucketing strategy.
+        // the identity columns become the key) or single-column pure-bucket.
+        // Any other shape (spec evolution, missing source column, mixed
+        // bucket+other transform, multi-column pure-bucket, unsupported
+        // identity dtype) collapses to `None`, which forces
+        // `UnknownPartitioning` regardless of bucketing strategy.
         let keys = bucketing::compute_partition_keys(&table, &output_schema);
 
         let (buckets, all_had_full_key) =
@@ -1880,161 +1881,12 @@ mod tests {
         }
     }
 
-    /// Multi-column pure-bucket spec: tasks are placed via the positional
-    /// linearisation `(idx_1 * N_2 + idx_2) % n_partitions`. Spec is
-    /// `bucket(2, name), bucket(4, id)`, target_partitions = 4.
+    /// Multi-column pure-bucket spec `(bucket(2, name), bucket(4, id))`:
+    /// even though every field is a bucket transform, multi-column specs
+    /// are no longer hash-declarable. Scan must fall back to
+    /// `Partitioning::UnknownPartitioning`.
     #[tokio::test]
-    async fn test_bucket_multi_column_linearised_placement() {
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-        use iceberg::spec::{
-            DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
-            Schema, Struct, Transform, Type, UnboundPartitionSpec,
-        };
-        use iceberg::transaction::{ApplyTransactionAction, Transaction};
-        use iceberg::{CatalogBuilder, TableCreation};
-
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let warehouse = temp_dir.path().to_str().unwrap().to_string();
-        let catalog: Arc<dyn Catalog> = Arc::new(
-            MemoryCatalogBuilder::default()
-                .load(
-                    "memory",
-                    std::collections::HashMap::from([(
-                        MEMORY_CATALOG_WAREHOUSE.to_string(),
-                        warehouse.clone(),
-                    )]),
-                )
-                .await
-                .unwrap(),
-        );
-        let namespace = NamespaceIdent::new("ns".to_string());
-        catalog
-            .create_namespace(&namespace, std::collections::HashMap::new())
-            .await
-            .unwrap();
-
-        let schema = Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-            ])
-            .build()
-            .unwrap();
-
-        // First spec field buckets `name` into 2 slots, second buckets `id`
-        // into 4 slots. The linearisation is `idx_name * 4 + idx_id`.
-        let partition_spec = UnboundPartitionSpec::builder()
-            .with_spec_id(0)
-            .add_partition_field(2, "name_bucket", Transform::Bucket(2))
-            .unwrap()
-            .add_partition_field(1, "id_bucket", Transform::Bucket(4))
-            .unwrap()
-            .build();
-
-        catalog
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("t".to_string())
-                    .location(format!("{warehouse}/t"))
-                    .schema(schema)
-                    .partition_spec(partition_spec)
-                    .properties(std::collections::HashMap::new())
-                    .build(),
-            )
-            .await
-            .unwrap();
-
-        let table = catalog
-            .load_table(&TableIdent::new(namespace.clone(), "t".to_string()))
-            .await
-            .unwrap();
-
-        // (name_idx, id_idx) → linear = name_idx * 4 + id_idx → dest = linear % 4
-        // (0,0) → 0 % 4 = 0
-        // (0,1) → 1 % 4 = 1
-        // (1,0) → 4 % 4 = 0
-        // (1,3) → 7 % 4 = 3
-        let tuples: [(i32, i32); 4] = [(0, 0), (0, 1), (1, 0), (1, 3)];
-        let data_files = tuples
-            .iter()
-            .enumerate()
-            .map(|(i, &(name_idx, id_idx))| {
-                DataFileBuilder::default()
-                    .content(DataContentType::Data)
-                    .file_path(format!(
-                        "{}/data/fake_{i}.parquet",
-                        table.metadata().location()
-                    ))
-                    .file_format(DataFileFormat::Parquet)
-                    .file_size_in_bytes(128)
-                    .record_count(1)
-                    .partition_spec_id(table.metadata().default_partition_spec_id())
-                    .partition(Struct::from_iter(vec![
-                        Some(Literal::int(name_idx)),
-                        Some(Literal::int(id_idx)),
-                    ]))
-                    .build()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let tx = Transaction::new(&table);
-        tx.fast_append()
-            .add_data_files(data_files)
-            .apply(tx)
-            .unwrap()
-            .commit(catalog.as_ref())
-            .await
-            .unwrap();
-
-        let provider = IcebergTableProvider::try_new(catalog, namespace, "t".to_string())
-            .await
-            .unwrap();
-        let plan = provider
-            .scan(&ctx_with_target_partitions(4).state(), None, &[], None)
-            .await
-            .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
-        let buckets = scan.buckets();
-
-        assert_eq!(buckets.len(), 4);
-
-        let read_tuple = |task: &iceberg::scan::FileScanTask| -> (i32, i32) {
-            let part = task.partition.as_ref().expect("partition tuple");
-            let name_idx = match part.fields()[0].as_ref().expect("name slot") {
-                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => *v,
-                _ => panic!("unexpected name slot"),
-            };
-            let id_idx = match part.fields()[1].as_ref().expect("id slot") {
-                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => *v,
-                _ => panic!("unexpected id slot"),
-            };
-            (name_idx, id_idx)
-        };
-
-        let mut p0: Vec<(i32, i32)> = buckets[0].iter().map(read_tuple).collect();
-        let p1: Vec<(i32, i32)> = buckets[1].iter().map(read_tuple).collect();
-        let p2: Vec<(i32, i32)> = buckets[2].iter().map(read_tuple).collect();
-        let p3: Vec<(i32, i32)> = buckets[3].iter().map(read_tuple).collect();
-
-        p0.sort_unstable();
-        assert_eq!(p0, vec![(0, 0), (1, 0)], "partition 0");
-        assert_eq!(p1, vec![(0, 1)], "partition 1");
-        assert!(p2.is_empty(), "partition 2 should be empty");
-        assert_eq!(p3, vec![(1, 3)], "partition 3");
-    }
-
-    /// Multi-column pure-bucket spec `(bucket(2, name), bucket(4, id))`, but
-    /// the projection only retains `id`. `compute_bucket_cols` now skips the
-    /// missing `name` source and returns a single `BucketCol` for `id`. The
-    /// scan must declare `Partitioning::Hash([Column("id")], n_partitions)`,
-    /// and tasks must be distributed according to `idx_id % n_partitions`
-    /// alone — so two files with the same `id_bucket` slot end up in the
-    /// same DataFusion partition regardless of their `name_bucket` slot.
-    #[tokio::test]
-    async fn test_bucket_multi_column_partial_projection_declares_hash_on_subset() {
-        use datafusion::physical_expr::expressions::Column;
+    async fn test_multi_column_bucket_falls_back_to_unknown() {
         use datafusion::physical_plan::Partitioning;
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
@@ -2100,13 +1952,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Two files share `id_bucket = 0` but differ on `name_bucket`; they
-        // must co-locate after partial-projection on `id`. A third file with
-        // `id_bucket = 3` lands in a different partition. The fourth file
-        // brings the task count up to `target_partitions=4` so that
-        // `n_partitions = min(target, tasks.len()) = 4` and we can assert on
-        // the full 4-way layout.
-        let tuples: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 3), (0, 1)];
+        let tuples: [(i32, i32); 4] = [(0, 0), (0, 1), (1, 0), (1, 3)];
         let data_files = tuples
             .iter()
             .enumerate()
@@ -2141,61 +1987,15 @@ mod tests {
         let provider = IcebergTableProvider::try_new(catalog, namespace, "t".to_string())
             .await
             .unwrap();
-        // Project only "id" (idx 0); "name" (idx 1) is excluded.
-        let projection = vec![0_usize];
         let plan = provider
-            .scan(
-                &ctx_with_target_partitions(4).state(),
-                Some(&projection),
-                &[],
-                None,
-            )
+            .scan(&ctx_with_target_partitions(4).state(), None, &[], None)
             .await
             .unwrap();
         let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
 
         match &scan.properties().partitioning {
-            Partitioning::Hash(exprs, n) => {
-                assert_eq!(*n, 4);
-                assert_eq!(exprs.len(), 1, "only `id` survives the projection");
-                let col = exprs[0]
-                    .as_any()
-                    .downcast_ref::<Column>()
-                    .expect("expected Column expr");
-                assert_eq!(col.name(), "id");
-            }
-            other => panic!("expected Partitioning::Hash, got {other:?}"),
+            Partitioning::UnknownPartitioning(_) => {}
+            other => panic!("expected Partitioning::UnknownPartitioning, got {other:?}"),
         }
-
-        // dest = idx_id % 4 (linearisation reduces to `idx_id` alone). So:
-        //   (name=0, id=0) → 0
-        //   (name=1, id=0) → 0  ← co-located with the previous despite
-        //                          differing `name_bucket`
-        //   (name=1, id=3) → 3
-        //   (name=0, id=1) → 1
-        let buckets = scan.buckets();
-        assert_eq!(buckets.len(), 4);
-
-        let read_tuple = |task: &iceberg::scan::FileScanTask| -> (i32, i32) {
-            let part = task.partition.as_ref().expect("partition tuple");
-            let name_idx = match part.fields()[0].as_ref().expect("name slot") {
-                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => *v,
-                _ => panic!("unexpected name slot"),
-            };
-            let id_idx = match part.fields()[1].as_ref().expect("id slot") {
-                iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(v)) => *v,
-                _ => panic!("unexpected id slot"),
-            };
-            (name_idx, id_idx)
-        };
-
-        let mut p0: Vec<(i32, i32)> = buckets[0].iter().map(read_tuple).collect();
-        let p1: Vec<(i32, i32)> = buckets[1].iter().map(read_tuple).collect();
-        let p3: Vec<(i32, i32)> = buckets[3].iter().map(read_tuple).collect();
-        p0.sort_unstable();
-        assert_eq!(p0, vec![(0, 0), (1, 0)], "id_bucket=0 co-located");
-        assert_eq!(p1, vec![(0, 1)], "id_bucket=1 alone");
-        assert!(buckets[2].is_empty(), "partition 2 should be empty");
-        assert_eq!(p3, vec![(1, 3)], "id_bucket=3 alone");
     }
 }
