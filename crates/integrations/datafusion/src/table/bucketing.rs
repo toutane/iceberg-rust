@@ -126,6 +126,10 @@ pub(super) fn compute_bucket_cols(
     output_schema: &ArrowSchema,
 ) -> Option<Vec<BucketCol>> {
     let metadata = table.metadata();
+    // TODO: extend to handle time travel, e.g. when a `snapshot_id` is provided,
+    // we could accept tables with spec evolution as long as every file
+    // reachable from that snapshot was written under the same partition spec
+    // as the one we declare on.
     if metadata.partition_specs_iter().len() > 1 {
         return None;
     }
