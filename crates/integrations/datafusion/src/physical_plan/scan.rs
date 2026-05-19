@@ -34,6 +34,7 @@ use iceberg::scan::{FileScanTask, TableScan};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use crate::table::PartitionKeysKind;
 use crate::to_datafusion_error;
 
 /// Iceberg [`Table`] scan as a DataFusion [`ExecutionPlan`].
@@ -60,6 +61,8 @@ pub struct IcebergTableScan {
     predicates: Option<Predicate>,
     /// Pre-planned file scan tasks per partition (eager mode), or `None` (lazy mode).
     buckets: Option<Vec<Vec<FileScanTask>>>,
+    /// `None` when partitioning is `UnknownPartitioning`.
+    partition_keys_kind: Option<PartitionKeysKind>,
     /// Optional limit on the number of rows to return.
     limit: Option<usize>,
 }
@@ -146,8 +149,17 @@ impl IcebergTableScan {
             projection,
             predicates,
             buckets,
+            partition_keys_kind: None,
             limit,
         }
+    }
+
+    pub(crate) fn with_partition_keys_kind(
+        mut self,
+        partition_keys_kind: Option<PartitionKeysKind>,
+    ) -> Self {
+        self.partition_keys_kind = partition_keys_kind;
+        self
     }
 
     pub fn table(&self) -> &Table {
@@ -169,6 +181,12 @@ impl IcebergTableScan {
     /// Returns the pre-planned file task buckets, or an empty slice in lazy mode.
     pub fn buckets(&self) -> &[Vec<FileScanTask>] {
         self.buckets.as_deref().unwrap_or(&[])
+    }
+
+    /// Returns the transform family behind the `Partitioning::Hash` declaration,
+    /// or `None` when the scan declares `UnknownPartitioning`.
+    pub fn partition_keys_kind(&self) -> Option<PartitionKeysKind> {
+        self.partition_keys_kind
     }
 
     pub fn limit(&self) -> Option<usize> {
