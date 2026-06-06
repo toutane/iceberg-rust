@@ -43,6 +43,9 @@ typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
 mockito = { workspace = true }
 tokio = { workspace = true }
+typetag = { workspace = true }
