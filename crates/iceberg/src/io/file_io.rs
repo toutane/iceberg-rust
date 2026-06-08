@@ -24,7 +24,7 @@ use futures::{Stream, StreamExt};
 use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
 };
-use crate::Result;
+use crate::{Result, Runtime, RuntimeHandle};
 
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
@@ -65,8 +65,10 @@ pub struct FileIO {
     config: StorageConfig,
     /// Factory for creating storage instances
     factory: Arc<dyn StorageFactory>,
-    /// Cached storage instance (lazily initialized)
+    /// Cached raw storage instance (lazily initialized)
     storage: Arc<OnceLock<Arc<dyn Storage>>>,
+    /// IO runtime handle used for storage operations.
+    io_runtime: Option<RuntimeHandle>,
 }
 
 impl FileIO {
@@ -78,6 +80,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(MemoryStorageFactory),
             storage: Arc::new(OnceLock::new()),
+            io_runtime: None,
         }
     }
 
@@ -89,6 +92,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(LocalFsStorageFactory),
             storage: Arc::new(OnceLock::new()),
+            io_runtime: None,
         }
     }
 
@@ -97,11 +101,27 @@ impl FileIO {
         &self.config
     }
 
-    /// Get or create the storage instance.
+    /// Route IO-bound storage operations through the IO handle in `runtime`.
+    ///
+    /// If called with [`Self::with_io_runtime`], the last call wins.
+    pub fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.io_runtime = Some(runtime.io().clone());
+        self
+    }
+
+    /// Route IO-bound storage operations through `io_handle`.
+    ///
+    /// If called with [`Self::with_runtime`], the last call wins.
+    pub fn with_io_runtime(mut self, io_handle: tokio::runtime::Handle) -> Self {
+        self.io_runtime = Some(RuntimeHandle::from_tokio_handle(io_handle));
+        self
+    }
+
+    /// Get or create the raw storage instance.
     ///
     /// The factory is invoked on first access and the result is cached
     /// for all subsequent operations.
-    fn get_storage(&self) -> Result<Arc<dyn Storage>> {
+    fn get_raw_storage(&self) -> Result<Arc<dyn Storage>> {
         // Check if already initialized
         if let Some(storage) = self.storage.get() {
             return Ok(storage.clone());
@@ -115,6 +135,18 @@ impl FileIO {
 
         // Return whatever is in the cell (either ours or another thread's)
         Ok(self.storage.get().unwrap().clone())
+    }
+
+    /// Get the storage instance, wrapped for IO-runtime dispatch when configured.
+    fn get_storage(&self) -> Result<Arc<dyn Storage>> {
+        let storage = self.get_raw_storage()?;
+        match &self.io_runtime {
+            Some(runtime) => Ok(Arc::new(super::storage::RuntimeStorage::new(
+                storage,
+                runtime.clone(),
+            ))),
+            None => Ok(storage),
+        }
     }
 
     /// Deletes file.
@@ -191,6 +223,8 @@ pub struct FileIOBuilder {
     factory: Arc<dyn StorageFactory>,
     /// Storage configuration
     config: StorageConfig,
+    /// IO runtime handle used for storage operations.
+    io_runtime: Option<RuntimeHandle>,
 }
 
 impl FileIOBuilder {
@@ -199,6 +233,7 @@ impl FileIOBuilder {
         Self {
             factory,
             config: StorageConfig::new(),
+            io_runtime: None,
         }
     }
 
@@ -224,12 +259,29 @@ impl FileIOBuilder {
         &self.config
     }
 
+    /// Route IO-bound storage operations through the IO handle in `runtime`.
+    ///
+    /// If called with [`Self::with_io_runtime`], the last call wins.
+    pub fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.io_runtime = Some(runtime.io().clone());
+        self
+    }
+
+    /// Route IO-bound storage operations through `io_handle`.
+    ///
+    /// If called with [`Self::with_runtime`], the last call wins.
+    pub fn with_io_runtime(mut self, io_handle: tokio::runtime::Handle) -> Self {
+        self.io_runtime = Some(RuntimeHandle::from_tokio_handle(io_handle));
+        self
+    }
+
     /// Builds [`FileIO`].
     pub fn build(self) -> FileIO {
         FileIO {
             config: self.config,
             factory: self.factory,
             storage: Arc::new(OnceLock::new()),
+            io_runtime: self.io_runtime,
         }
     }
 }
@@ -274,6 +326,10 @@ impl InputFile {
     /// Creates a new input file.
     pub fn new(storage: Arc<dyn Storage>, path: String) -> Self {
         Self { storage, path }
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<dyn Storage>, String) {
+        (self.storage, self.path)
     }
 
     /// Absolute path to root uri.
@@ -339,6 +395,10 @@ impl OutputFile {
         Self { storage, path }
     }
 
+    pub(crate) fn into_parts(self) -> (Arc<dyn Storage>, String) {
+        (self.storage, self.path)
+    }
+
     /// Relative path to root uri.
     pub fn location(&self) -> &str {
         &self.path
@@ -390,14 +450,22 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use futures::AsyncReadExt;
     use futures::io::AllowStdIo;
+    use futures::stream::BoxStream;
     use tempfile::TempDir;
 
     use super::{FileIO, FileIOBuilder};
-    use crate::io::{LocalFsStorageFactory, MemoryStorageFactory};
+    use crate::io::{
+        FileRead, FileWrite, InputFile, LocalFsStorageFactory, MemoryStorageFactory, OutputFile,
+        Storage, StorageFactory,
+    };
+
+    const CPU_THREAD_NAME: &str = "iceberg-file-io-cpu-test";
+    const IO_THREAD_NAME: &str = "iceberg-file-io-io-test";
 
     fn create_local_file_io() -> FileIO {
         FileIO::new_with_fs()
@@ -543,5 +611,143 @@ mod tests {
 
         assert_eq!(file_io.config().get("key1"), Some(&"value1".to_string()));
         assert_eq!(file_io.config().get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_file_io_with_runtime_wraps_builder_and_cached_storage() {
+        let (cpu_rt, io_rt) = split_test_runtimes();
+
+        let factory = Arc::new(ThreadNameStorageFactory::default());
+        let (raw_exists, late_wrapped_exists, cached_builds) = cpu_rt.block_on(async {
+            let file_io = FileIOBuilder::new(factory.clone()).build();
+            let raw_exists = file_io.exists("memory://thread-name").await.unwrap();
+
+            let file_io = file_io.with_io_runtime(io_rt.handle().clone());
+            let late_wrapped_exists = file_io.exists("memory://thread-name").await.unwrap();
+
+            let reader = FileIOBuilder::new(Arc::new(ThreadNameStorageFactory::default()))
+                .with_io_runtime(io_rt.handle().clone())
+                .build()
+                .new_input("memory://thread-name")
+                .unwrap()
+                .reader()
+                .await
+                .unwrap();
+            reader.read(0..1).await.unwrap();
+
+            (
+                raw_exists,
+                late_wrapped_exists,
+                factory.builds.load(Ordering::SeqCst),
+            )
+        });
+
+        assert!(!raw_exists);
+        assert!(late_wrapped_exists);
+        assert_eq!(cached_builds, 1);
+    }
+
+    fn split_test_runtimes() -> (tokio::runtime::Runtime, tokio::runtime::Runtime) {
+        let cpu_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name(CPU_THREAD_NAME)
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name(IO_THREAD_NAME)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        (cpu_rt, io_rt)
+    }
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct ThreadNameStorageFactory {
+        #[serde(skip)]
+        builds: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for ThreadNameStorageFactory {
+        fn build(&self, _config: &crate::io::StorageConfig) -> crate::Result<Arc<dyn Storage>> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(ThreadNameStorage::default()))
+        }
+    }
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct ThreadNameStorage {
+        input: bool,
+    }
+
+    #[async_trait::async_trait]
+    #[typetag::serde]
+    impl Storage for ThreadNameStorage {
+        async fn exists(&self, _path: &str) -> crate::Result<bool> {
+            Ok(std::thread::current().name() == Some(IO_THREAD_NAME))
+        }
+
+        async fn metadata(&self, _path: &str) -> crate::Result<crate::io::FileMetadata> {
+            unimplemented!("not used")
+        }
+
+        async fn read(&self, _path: &str) -> crate::Result<Bytes> {
+            unimplemented!("not used")
+        }
+
+        async fn reader(&self, path: &str) -> crate::Result<Box<dyn FileRead>> {
+            assert_io_thread();
+            assert!(self.input);
+            assert!(path.ends_with("#input"), "{path} should end with #input");
+            Ok(Box::new(ThreadNameFileRead))
+        }
+
+        async fn write(&self, _path: &str, _bs: Bytes) -> crate::Result<()> {
+            unimplemented!("not used")
+        }
+
+        async fn writer(&self, _path: &str) -> crate::Result<Box<dyn FileWrite>> {
+            unimplemented!("not used")
+        }
+
+        async fn delete(&self, _path: &str) -> crate::Result<()> {
+            unimplemented!("not used")
+        }
+
+        async fn delete_prefix(&self, _path: &str) -> crate::Result<()> {
+            unimplemented!("not used")
+        }
+
+        async fn delete_stream(&self, _paths: BoxStream<'static, String>) -> crate::Result<()> {
+            unimplemented!("not used")
+        }
+
+        fn new_input(&self, path: &str) -> crate::Result<InputFile> {
+            Ok(InputFile::new(
+                Arc::new(Self { input: true }),
+                format!("{path}#input"),
+            ))
+        }
+
+        fn new_output(&self, _path: &str) -> crate::Result<OutputFile> {
+            unimplemented!("not used")
+        }
+    }
+
+    struct ThreadNameFileRead;
+
+    #[async_trait::async_trait]
+    impl FileRead for ThreadNameFileRead {
+        async fn read(&self, _range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            assert_io_thread();
+            Ok(Bytes::new())
+        }
+    }
+
+    fn assert_io_thread() {
+        assert_eq!(std::thread::current().name(), Some(IO_THREAD_NAME));
     }
 }

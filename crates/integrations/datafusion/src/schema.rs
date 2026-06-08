@@ -329,9 +329,10 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = IcebergSchemaProvider::try_new_with_runtime(Arc::new(catalog), namespace, None)
-            .await
-            .unwrap();
+        let provider =
+            IcebergSchemaProvider::try_new_with_runtime(Arc::new(catalog), namespace, None)
+                .await
+                .unwrap();
 
         (provider, temp_dir)
     }

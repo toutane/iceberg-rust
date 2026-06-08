@@ -257,7 +257,9 @@ impl SqlCatalog {
                 "StorageFactory must be provided for SqlCatalog. Use `with_storage_factory` to configure it.",
             )
         })?;
-        let fileio = FileIOBuilder::new(factory).build();
+        let fileio = FileIOBuilder::new(factory)
+            .with_runtime(runtime.clone())
+            .build();
 
         install_default_drivers();
         let max_connections: u32 = config
