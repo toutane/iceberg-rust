@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -155,8 +157,7 @@ pub(super) fn compute_bucket_cols(
 /// Identifies the transform family behind a `Partitioning::Hash` declaration
 /// on an [`IcebergTableScan`][crate::physical_plan::scan::IcebergTableScan].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PartitionKeysKind {
+pub(super) enum PartitionKeysKind {
     /// Keys come from `Transform::Identity` fields.
     Identity,
     /// Keys come from `Transform::Bucket(_)` fields.
@@ -332,8 +333,6 @@ fn bucket_index(task: &FileScanTask, cols: &[BucketCol]) -> Option<u64> {
 /// bucket. The hash function does not need to match DataFusion's because any
 /// task taking this path causes the scan to drop to `UnknownPartitioning`.
 fn fallback_hash(task: &FileScanTask) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     task.data_file_path.hash(&mut hasher);
     hasher.finish()

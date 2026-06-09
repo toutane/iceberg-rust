@@ -18,6 +18,9 @@
 mod catalog;
 pub use catalog::*;
 
+mod config;
+pub use config::{IcebergScanConfig, ParsePartitioningOverrideError, PartitioningOverride};
+
 mod error;
 pub use error::*;
 

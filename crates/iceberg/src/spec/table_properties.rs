@@ -219,6 +219,16 @@ impl TableProperties {
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+    /// Whether DataFusion scans may declare hash partitioning from identity partitions.
+    pub const PROPERTY_DATAFUSION_VALUE_PARTITIONING_ENABLED: &str =
+        "read.datafusion.value-partitioning.enabled";
+    /// Default value for DataFusion identity partitioning.
+    pub const PROPERTY_DATAFUSION_VALUE_PARTITIONING_ENABLED_DEFAULT: bool = false;
+    /// Whether DataFusion scans may declare hash partitioning from bucket transforms.
+    pub const PROPERTY_DATAFUSION_BUCKET_EXECUTION_ENABLED: &str =
+        "read.datafusion.bucket-execution.enabled";
+    /// Default value for DataFusion bucket execution.
+    pub const PROPERTY_DATAFUSION_BUCKET_EXECUTION_ENABLED_DEFAULT: bool = true;
 
     /// Property key for enabling garbage collection on drop.
     /// When set to `false`, data files will not be deleted when a table is dropped.
