@@ -31,6 +31,7 @@ pub mod metadata_table;
 pub mod table_provider_factory;
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -41,21 +42,23 @@ use datafusion::common::DataFusionError;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::TableProperties;
+use iceberg::spec::{TableProperties, Transform};
 use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
-use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
+use crate::physical_plan::expr_to_predicate::{
+    convert_filter_to_predicate, convert_filters_to_predicate,
+};
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
@@ -321,6 +324,7 @@ pub struct IcebergStaticTableProvider {
     snapshot_id: Option<i64>,
     /// A reference-counted arrow `Schema`
     schema: ArrowSchemaRef,
+    identity_partition_cols: HashSet<String>,
 }
 
 impl IcebergStaticTableProvider {
@@ -328,11 +332,14 @@ impl IcebergStaticTableProvider {
     ///
     /// Uses the table's current snapshot for all queries. Does not support write operations.
     pub async fn try_new_from_table(table: Table) -> Result<Self> {
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let table_schema = table.metadata().current_schema();
+        let schema = Arc::new(schema_to_arrow_schema(table_schema)?);
+        let identity_partition_cols = identity_partition_col_names(&table, table_schema);
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: None,
             schema,
+            identity_partition_cols,
         })
     }
 
@@ -355,10 +362,12 @@ impl IcebergStaticTableProvider {
             })?;
         let table_schema = snapshot.schema(table.metadata())?;
         let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
+        let identity_partition_cols = identity_partition_col_names(&table, &table_schema);
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: Some(snapshot_id),
             schema,
+            identity_partition_cols,
         })
     }
 }
@@ -398,8 +407,18 @@ impl TableProvider for IcebergStaticTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if convert_filter_to_predicate(filter).is_some()
+                    && is_exact_on_identity(filter, &self.identity_partition_cols)
+                {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn insert_into(
@@ -417,17 +436,94 @@ impl TableProvider for IcebergStaticTableProvider {
     }
 }
 
+fn identity_partition_col_names(
+    table: &Table,
+    table_schema: &iceberg::spec::Schema,
+) -> HashSet<String> {
+    let mut identity_cols: Option<HashSet<String>> = None;
+
+    for spec in table.metadata().partition_specs_iter() {
+        let spec_cols = spec
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                if field.transform == Transform::Identity {
+                    table_schema
+                        .field_by_id(field.source_id)
+                        .map(|source_field| source_field.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<_>>();
+
+        identity_cols = Some(match identity_cols {
+            Some(cols) => cols.intersection(&spec_cols).cloned().collect(),
+            None => spec_cols,
+        });
+    }
+
+    identity_cols.unwrap_or_default()
+}
+
+fn is_exact_on_identity(expr: &Expr, cols: &HashSet<String>) -> bool {
+    if cols.is_empty() {
+        return false;
+    }
+
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And | Operator::Or => {
+                is_exact_on_identity(&binary.left, cols)
+                    && is_exact_on_identity(&binary.right, cols)
+            }
+            Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                is_identity_col_literal_pair(&binary.left, &binary.right, cols)
+            }
+            _ => false,
+        },
+        Expr::IsNull(expr) | Expr::IsNotNull(expr) => is_identity_col(expr, cols),
+        Expr::InList(in_list) => {
+            !in_list.negated
+                && is_identity_col(&in_list.expr, cols)
+                && in_list.list.iter().all(is_literal)
+        }
+        _ => false,
+    }
+}
+
+fn is_identity_col_literal_pair(left: &Expr, right: &Expr, cols: &HashSet<String>) -> bool {
+    (is_identity_col(left, cols) && is_literal(right))
+        || (is_literal(left) && is_identity_col(right, cols))
+}
+
+fn is_identity_col(expr: &Expr, cols: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Column(column) => cols.contains(column.name()),
+        _ => false,
+    }
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_, _))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use datafusion::common::Column;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::common::{Column, DFSchema};
+    use datafusion::datasource::TableProvider;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
     use iceberg::io::FileIO;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::spec::{
+        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder,
+        Transform, Type, UnboundPartitionSpec,
+    };
     use iceberg::table::{StaticTable, Table};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use tempfile::TempDir;
@@ -495,6 +591,271 @@ mod tests {
             "test_table".to_string(),
             temp_dir,
         )
+    }
+
+    fn filter_expr(sql: &str) -> Expr {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]);
+        let df_schema = DFSchema::try_from_qualified_schema("test_table", &arrow_schema).unwrap();
+
+        SessionContext::new()
+            .parse_sql_expr(sql, &df_schema)
+            .unwrap()
+    }
+
+    fn test_table_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "flag", Type::Primitive(PrimitiveType::Boolean)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn build_table_with_specs(specs: Vec<UnboundPartitionSpec>) -> Table {
+        let mut specs = specs.into_iter();
+        let first_spec = specs.next().unwrap_or_default();
+        let mut metadata = TableMetadataBuilder::new(
+            test_table_schema(),
+            first_spec,
+            SortOrder::unsorted_order(),
+            "memory://warehouse/test_table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        for spec in specs {
+            metadata = metadata
+                .into_builder(Some(
+                    "memory://warehouse/test_table/metadata.json".to_string(),
+                ))
+                .add_partition_spec(spec)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+        }
+
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["test_ns", "test_table"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .build()
+            .unwrap()
+    }
+
+    fn identity_spec(source_id: i32, name: &str) -> UnboundPartitionSpec {
+        UnboundPartitionSpec::builder()
+            .add_partition_field(source_id, name, Transform::Identity)
+            .unwrap()
+            .build()
+    }
+
+    fn bucket_spec(source_id: i32, name: &str) -> UnboundPartitionSpec {
+        UnboundPartitionSpec::builder()
+            .add_partition_field(source_id, name, Transform::Bucket(16))
+            .unwrap()
+            .build()
+    }
+
+    fn plan_contains_node(plan: &Arc<dyn ExecutionPlan>, node_name: &str) -> bool {
+        if plan.name() == node_name {
+            return true;
+        }
+
+        plan.children()
+            .into_iter()
+            .any(|child| plan_contains_node(child, node_name))
+    }
+
+    #[test]
+    fn test_identity_partition_col_names_intersects_compatible_specs() {
+        let mixed_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(1, "id", Transform::Identity)
+            .unwrap()
+            .add_partition_field(2, "name_bucket", Transform::Bucket(16))
+            .unwrap()
+            .build();
+        let table = build_table_with_specs(vec![mixed_spec, identity_spec(1, "id")]);
+
+        let cols = identity_partition_col_names(&table, table.metadata().current_schema());
+
+        assert_eq!(cols, HashSet::from(["id".to_string()]));
+    }
+
+    #[test]
+    fn test_identity_partition_col_names_drops_bucket_evolved_column() {
+        let table =
+            build_table_with_specs(vec![identity_spec(1, "id"), bucket_spec(1, "id_bucket")]);
+
+        let cols = identity_partition_col_names(&table, table.metadata().current_schema());
+
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn test_identity_partition_col_names_drops_column_missing_from_spec() {
+        let table = build_table_with_specs(vec![identity_spec(1, "id"), identity_spec(2, "name")]);
+
+        let cols = identity_partition_col_names(&table, table.metadata().current_schema());
+
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn test_is_exact_on_identity_accepts_positive_predicates() {
+        let cols = HashSet::from(["id".to_string()]);
+
+        for sql in [
+            "id = 1",
+            "id < 1",
+            "id <= 1",
+            "id > 1",
+            "id >= 1",
+            "id in (1, 2)",
+            "id is null",
+            "id is not null",
+            "id = 1 and id > 0",
+            "id = 1 or id = 2",
+        ] {
+            assert!(is_exact_on_identity(&filter_expr(sql), &cols), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_is_exact_on_identity_rejects_unsafe_predicates() {
+        let cols = HashSet::from(["id".to_string()]);
+
+        for sql in [
+            "name = 'a'",
+            "length(name) = 1",
+            "id = 1 and name = 'a'",
+            "id = 1 or name = 'a'",
+            "id != 1",
+            "id not in (1, 2)",
+            "not id = 1",
+            "flag",
+        ] {
+            assert!(!is_exact_on_identity(&filter_expr(sql), &cols), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_static_provider_marks_identity_filters_exact() {
+        let table = build_table_with_specs(vec![identity_spec(1, "id")]);
+        let provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .unwrap();
+        let exact_expr = filter_expr("id = 1");
+        let inexact_expr = filter_expr("id != 1");
+        let filters = [&exact_expr, &inexact_expr];
+
+        let pushdown = provider.supports_filters_pushdown(&filters).unwrap();
+
+        assert_eq!(
+            pushdown,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Inexact
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_provider_keeps_identity_filters_inexact() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_partitioned_test_catalog_and_table(Some(true)).await;
+        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let expr = filter_expr("id = 1");
+        let filters = [&expr];
+
+        let pushdown = provider.supports_filters_pushdown(&filters).unwrap();
+
+        assert_eq!(pushdown, vec![TableProviderFilterPushDown::Inexact]);
+    }
+
+    #[tokio::test]
+    async fn test_static_identity_exact_removes_filter_exec() {
+        let table = build_table_with_specs(vec![identity_spec(1, "id")]);
+        let provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", Arc::new(provider))
+            .unwrap();
+
+        let plan = ctx
+            .sql("SELECT * FROM test_table WHERE id = 1")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        assert!(plan_contains_node(&plan, "IcebergTableScan"));
+        assert!(!plan_contains_node(&plan, "FilterExec"));
+    }
+
+    #[tokio::test]
+    async fn test_static_inexact_filters_keep_filter_exec() {
+        let table = build_table_with_specs(vec![identity_spec(1, "id")]);
+        let provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", Arc::new(provider))
+            .unwrap();
+
+        for sql in [
+            "SELECT * FROM test_table WHERE name = 'a'",
+            "SELECT * FROM test_table WHERE id != 1",
+        ] {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+
+            assert!(plan_contains_node(&plan, "IcebergTableScan"), "{sql}");
+            assert!(plan_contains_node(&plan, "FilterExec"), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_catalog_identity_filter_keeps_filter_exec() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_partitioned_test_catalog_and_table(Some(true)).await;
+        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", Arc::new(provider))
+            .unwrap();
+
+        let plan = ctx
+            .sql("SELECT * FROM test_table WHERE category = 'a'")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        assert!(plan_contains_node(&plan, "IcebergTableScan"));
+        assert!(plan_contains_node(&plan, "FilterExec"));
     }
 
     // Tests for IcebergStaticTableProvider
