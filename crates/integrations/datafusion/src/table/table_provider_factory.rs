@@ -46,7 +46,7 @@ use crate::to_datafusion_error;
 /// use datafusion::sql::TableReference;
 /// use iceberg_datafusion::IcebergTableProviderFactory;
 ///
-/// #[tokio::main]
+/// #[tokio::main(flavor = "current_thread")]
 /// async fn main() {
 ///     // Create a new session context
 ///     let mut state = SessionStateBuilder::new().with_default_features().build();
