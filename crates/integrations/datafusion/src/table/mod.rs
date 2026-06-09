@@ -356,16 +356,11 @@ fn resolve_partitioning_family(
 }
 
 fn parse_bool_table_property(property_name: &str, value: &str) -> DFResult<bool> {
-    value
-        .parse::<bool>()
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Invalid value for {property_name}, expected 'true' or 'false'"),
-            )
-            .with_source(e)
-        })
-        .map_err(to_datafusion_error)
+    value.parse::<bool>().map_err(|e| {
+        DataFusionError::Plan(format!(
+            "Invalid value for {property_name}, expected 'true' or 'false': {e}"
+        ))
+    })
 }
 
 /// Static table provider for read-only snapshot access.
