@@ -39,12 +39,11 @@ use crate::to_datafusion_error;
 
 /// Iceberg [`Table`] scan as a DataFusion [`ExecutionPlan`].
 ///
-/// Has three construction modes: [`new`][Self::new] (lazy, single-partition),
-/// [`new_with_tasks`][Self::new_with_tasks] (eager, over pre-planned
-/// [`FileScanTask`] buckets), and
-/// [`new_with_tasks_from_predicate`][Self::new_with_tasks_from_predicate]
-/// (eager, from a [`Predicate`]) — the last lets a node be rebuilt from its
-/// getters, e.g. by a distributed-plan codec.
+/// Has three construction modes: [`new`][Self::new] for a lazy
+/// single-partition scan, [`new_with_tasks`][Self::new_with_tasks] for an
+/// eager scan over pre-planned [`FileScanTask`] buckets, and
+/// [`new_with_tasks_from_predicate`][Self::new_with_tasks_from_predicate] for
+/// rebuilding an eager scan from a [`Predicate`].
 ///
 /// Note: in eager mode the underlying `TableScan` is rebuilt on every
 /// `execute(partition)` call. The per-build cost is bounded (no I/O) and
@@ -60,11 +59,9 @@ pub struct IcebergTableScan {
     plan_properties: Arc<PlanProperties>,
     /// Projection column names, None means all columns.
     projection: Option<Vec<String>>,
-    /// Full schema before projection. Kept verbatim, not re-derived: the
-    /// provider caches it while reloading the table, so it can diverge from the
-    /// table's current metadata.
+    /// Full schema before projection.
     table_schema: ArrowSchemaRef,
-    /// Projection indices as received by `scan`; `projection` keeps only names.
+    /// Projection indices as received by `scan`.
     projection_indices: Option<Vec<usize>>,
     /// Filters to apply to the table scan.
     predicates: Option<Predicate>,
@@ -127,10 +124,7 @@ impl IcebergTableScan {
         )
     }
 
-    /// Eager variant taking a [`Predicate`] instead of [`Expr`] filters, so a
-    /// node can be rebuilt from its getters. The predicate is unbound; the scan
-    /// builder binds it at `execute` time.
-    // Arity mirrors `new_with_tasks`; an args struct is deferred.
+    /// Creates an eager multi-partition scan from a [`Predicate`].
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_tasks_from_predicate(
         table: Table,
