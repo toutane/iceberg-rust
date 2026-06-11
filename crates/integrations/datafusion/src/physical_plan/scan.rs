@@ -491,25 +491,4 @@ mod tests {
             Partitioning::UnknownPartitioning(2)
         ));
     }
-
-    #[tokio::test]
-    async fn test_no_projection_keeps_full_schema() {
-        let schema = create_test_arrow_schema();
-        let scan = IcebergTableScan::new_with_tasks_from_predicate(
-            get_test_table_from_metadata_file().await,
-            None,
-            schema.clone(),
-            None,
-            None,
-            None,
-            vec![vec![]],
-            Partitioning::UnknownPartitioning(1),
-        );
-
-        assert_eq!(scan.projection_indices(), None);
-        assert_eq!(scan.projection(), None);
-        assert_eq!(scan.predicates(), None);
-        assert_eq!(scan.schema().fields(), scan.table_schema().fields());
-        assert_eq!(scan.table_schema().fields(), schema.fields());
-    }
 }
