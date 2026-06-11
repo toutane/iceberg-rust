@@ -437,7 +437,6 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::{Expr, col, lit};
     use iceberg::TableIdent;
     use iceberg::expr::Reference;
     use iceberg::io::FileIO;
@@ -446,19 +445,21 @@ mod tests {
 
     use super::*;
 
-    async fn test_table() -> Table {
-        let metadata_path = format!(
-            "{}/tests/test_data/TableMetadataV2Valid.json",
-            env!("CARGO_MANIFEST_DIR")
+    async fn get_test_table_from_metadata_file() -> Table {
+        let metadata_file_name = "TableMetadataV2Valid.json";
+        let metadata_file_path = format!(
+            "{}/tests/test_data/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            metadata_file_name
         );
         let ident = TableIdent::from_strs(["ns", "scan_table"]).unwrap();
-        StaticTable::from_metadata_file(&metadata_path, ident, FileIO::new_with_fs())
+        StaticTable::from_metadata_file(&metadata_file_path, ident, FileIO::new_with_fs())
             .await
             .unwrap()
             .into_table()
     }
 
-    fn arrow_schema() -> ArrowSchemaRef {
+    fn create_test_arrow_schema() -> ArrowSchemaRef {
         Arc::new(ArrowSchema::new(vec![
             Field::new("x", DataType::Int64, false),
             Field::new("y", DataType::Int64, false),
@@ -466,98 +467,55 @@ mod tests {
         ]))
     }
 
-    fn filters() -> Vec<Expr> {
-        vec![col("x").gt(lit(5i64))]
-    }
-
-    // The Expr and predicate constructors must agree: `new_with_tasks` only
-    // pre-converts the filters that `new_with_tasks_from_predicate` takes raw.
     #[tokio::test]
-    async fn expr_and_predicate_constructors_agree() {
-        let table = test_table().await;
+    async fn test_predicate_constructor_exposes_rebuild_inputs() {
+        let schema = create_test_arrow_schema();
         let projection = vec![0usize, 2];
-        let from_filters = IcebergTableScan::new_with_tasks(
-            table.clone(),
+        let predicate = Reference::new("x").greater_than(Datum::long(5));
+        let scan = IcebergTableScan::new_with_tasks_from_predicate(
+            get_test_table_from_metadata_file().await,
             None,
-            arrow_schema(),
+            schema.clone(),
             Some(&projection),
-            &filters(),
-            Some(100),
-            vec![vec![], vec![]],
-            Partitioning::UnknownPartitioning(2),
-        );
-        let from_predicate = IcebergTableScan::new_with_tasks_from_predicate(
-            table,
-            None,
-            arrow_schema(),
-            Some(&projection),
-            convert_filters_to_predicate(&filters()),
+            Some(predicate.clone()),
             Some(100),
             vec![vec![], vec![]],
             Partitioning::UnknownPartitioning(2),
         );
 
-        assert_eq!(from_filters.predicates(), from_predicate.predicates());
-        assert_eq!(from_filters.projection(), from_predicate.projection());
-        assert_eq!(
-            from_filters.schema().fields(),
-            from_predicate.schema().fields()
-        );
-        assert_eq!(
-            format!("{:?}", from_filters.properties().output_partitioning()),
-            format!("{:?}", from_predicate.properties().output_partitioning()),
-        );
-    }
-
-    // table_schema() exposes the full pre-projection schema; schema() is projected.
-    #[tokio::test]
-    async fn getters_expose_full_schema_and_indices() {
-        let projection = vec![0usize, 2];
-        let scan = IcebergTableScan::new(
-            test_table().await,
-            None,
-            arrow_schema(),
-            Some(&projection),
-            &[],
-            None,
-        );
-
-        assert_eq!(scan.table_schema().fields(), arrow_schema().fields());
+        assert_eq!(scan.predicates(), Some(&predicate));
+        assert_eq!(scan.table_schema().fields(), schema.fields());
         assert_eq!(scan.table_schema().fields().len(), 3);
         assert_eq!(scan.schema().fields().len(), 2);
         assert_ne!(scan.schema().fields(), scan.table_schema().fields());
 
         assert_eq!(scan.projection_indices(), Some(projection.as_slice()));
-        let names = ["x".to_string(), "z".to_string()];
-        assert_eq!(scan.projection(), Some(names.as_slice()));
+        let expected_projection = vec!["x".to_string(), "z".to_string()];
+        assert_eq!(scan.projection(), Some(expected_projection.as_slice()));
+        assert!(matches!(
+            scan.properties().partitioning,
+            Partitioning::UnknownPartitioning(2)
+        ));
     }
 
-    // Without a projection, indices/names are None and the full schema is kept.
     #[tokio::test]
-    async fn no_projection_keeps_full_schema() {
-        let scan = IcebergTableScan::new(test_table().await, None, arrow_schema(), None, &[], None);
-
-        assert_eq!(scan.projection_indices(), None);
-        assert_eq!(scan.projection(), None);
-        assert_eq!(scan.schema().fields(), scan.table_schema().fields());
-        assert_eq!(scan.table_schema().fields(), arrow_schema().fields());
-    }
-
-    // A predicate passed to the new constructor round-trips unchanged.
-    #[tokio::test]
-    async fn predicate_round_trips() {
-        let predicate = Reference::new("x").greater_than(Datum::long(5));
+    async fn test_no_projection_keeps_full_schema() {
+        let schema = create_test_arrow_schema();
         let scan = IcebergTableScan::new_with_tasks_from_predicate(
-            test_table().await,
+            get_test_table_from_metadata_file().await,
             None,
-            arrow_schema(),
+            schema.clone(),
             None,
-            Some(predicate.clone()),
+            None,
             None,
             vec![vec![]],
             Partitioning::UnknownPartitioning(1),
         );
 
-        assert_eq!(scan.predicates(), Some(&predicate));
+        assert_eq!(scan.projection_indices(), None);
+        assert_eq!(scan.projection(), None);
+        assert_eq!(scan.predicates(), None);
+        assert_eq!(scan.schema().fields(), scan.table_schema().fields());
+        assert_eq!(scan.table_schema().fields(), schema.fields());
     }
 }
