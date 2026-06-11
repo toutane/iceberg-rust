@@ -26,7 +26,6 @@
 //!   table snapshot. Use for consistent analytical queries or time-travel scenarios.
 
 mod bucketing;
-pub use bucketing::PartitionKeysKind;
 pub mod metadata_table;
 pub mod table_provider_factory;
 
@@ -249,12 +248,11 @@ impl TableProvider for IcebergTableProvider {
         let (buckets, all_had_full_key) =
             bucketing::bucket_tasks(tasks, n_partitions, keys.as_ref());
 
-        let (partitioning, partition_keys_kind) = match &keys {
-            Some(keys) if all_had_full_key && n_partitions > 0 => (
-                Partitioning::Hash(keys.column_exprs(), n_partitions),
-                Some(keys.kind()),
-            ),
-            _ => (Partitioning::UnknownPartitioning(n_partitions), None),
+        let partitioning = match &keys {
+            Some(keys) if all_had_full_key && n_partitions > 0 => {
+                Partitioning::Hash(keys.column_exprs(), n_partitions)
+            }
+            _ => Partitioning::UnknownPartitioning(n_partitions),
         };
 
         Ok(Arc::new(
@@ -268,7 +266,6 @@ impl TableProvider for IcebergTableProvider {
                 buckets,
                 partitioning,
             )
-            .with_partition_keys_kind(partition_keys_kind),
         ))
     }
 
@@ -1334,10 +1331,6 @@ mod tests {
             }
             other => panic!("expected Partitioning::Hash, got {other:?}"),
         }
-        assert_eq!(
-            scan.partition_keys_kind(),
-            Some(super::PartitionKeysKind::Identity),
-        );
     }
 
     /// A projection that omits the partition source column drops
@@ -1370,7 +1363,6 @@ mod tests {
             scan.properties().partitioning,
             Partitioning::UnknownPartitioning(_)
         ));
-        assert_eq!(scan.partition_keys_kind(), None);
     }
 
     // ── Bucket-transform partitioning tests ─────────────────────────────────
@@ -1529,10 +1521,6 @@ mod tests {
             }
             other => panic!("expected Partitioning::Hash, got {other:?}"),
         }
-        assert_eq!(
-            scan.partition_keys_kind(),
-            Some(super::PartitionKeysKind::Bucket),
-        );
     }
 
     /// Single-column bucket spec where the projection excludes the *only*
@@ -1573,7 +1561,6 @@ mod tests {
             scan.properties().partitioning,
             Partitioning::UnknownPartitioning(_)
         ));
-        assert_eq!(scan.partition_keys_kind(), None);
     }
 
     /// A `None` partition slot makes `bucket_hash` return `None`, so the
@@ -1605,7 +1592,6 @@ mod tests {
             scan.properties().partitioning,
             Partitioning::UnknownPartitioning(_)
         ));
-        assert_eq!(scan.partition_keys_kind(), None);
     }
 
     /// Mixed `Bucket[N] + Truncate(_)` spec: `compute_bucket_cols` rejects
@@ -1712,7 +1698,6 @@ mod tests {
             scan.properties().partitioning,
             Partitioning::UnknownPartitioning(_)
         ));
-        assert_eq!(scan.partition_keys_kind(), None);
     }
 
     /// Mixed `Identity + Bucket` spec must keep the existing behaviour:
@@ -1845,10 +1830,6 @@ mod tests {
             }
             other => panic!("expected Partitioning::Hash, got {other:?}"),
         }
-        assert_eq!(
-            scan.partition_keys_kind(),
-            Some(super::PartitionKeysKind::Identity),
-        );
     }
 
     /// Pure `Bucket[N]` with `target_partitions == N`: tasks must land

@@ -152,17 +152,6 @@ pub(super) fn compute_bucket_cols(
     }])
 }
 
-/// Identifies the transform family behind a `Partitioning::Hash` declaration
-/// on an [`IcebergTableScan`][crate::physical_plan::scan::IcebergTableScan].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PartitionKeysKind {
-    /// Keys come from `Transform::Identity` fields.
-    Identity,
-    /// Keys come from `Transform::Bucket(_)` fields.
-    Bucket,
-}
-
 /// Single-entry partition-key descriptor used by [`bucket_tasks`] and
 /// `IcebergTableProvider::scan` to drive both task distribution and the
 /// `Partitioning::Hash` declaration.
@@ -184,13 +173,6 @@ impl PartitionKeys {
                 .iter()
                 .map(|c| Arc::new(Column::new(&c.name, c.output_idx)) as Arc<dyn PhysicalExpr>)
                 .collect(),
-        }
-    }
-
-    pub(super) fn kind(&self) -> PartitionKeysKind {
-        match self {
-            PartitionKeys::Identity(_) => PartitionKeysKind::Identity,
-            PartitionKeys::Bucket(_) => PartitionKeysKind::Bucket,
         }
     }
 }
