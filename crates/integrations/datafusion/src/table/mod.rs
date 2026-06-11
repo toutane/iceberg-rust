@@ -52,6 +52,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, Runtime, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
+use crate::config::IcebergConfig;
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
@@ -184,6 +185,12 @@ impl TableProvider for IcebergTableProvider {
         let predicate = convert_filters_to_predicate(filters);
 
         let target_partitions = state.config().target_partitions();
+        let iceberg_config = state
+            .config_options()
+            .extensions
+            .get::<IcebergConfig>()
+            .cloned()
+            .unwrap_or_default();
 
         // Second load: fetch the latest snapshot so scans always reflect current
         // table state. Catalog IO is routed through the configured IO runtime.
@@ -221,7 +228,6 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        // ── CPU-bound: schema projection + bucketing ──────────────────────────
         // Output schema after projection: column indices in `Hash` exprs and any
         // Arrow array we hash must reference this schema, not the full table schema.
         let output_schema = match projection {
@@ -243,7 +249,12 @@ impl TableProvider for IcebergTableProvider {
         // bucket+other transform, multi-column pure-bucket, unsupported
         // identity dtype) collapses to `None`, which forces
         // `UnknownPartitioning` regardless of bucketing strategy.
-        let keys = bucketing::compute_partition_keys(&table, &output_schema);
+        let keys = bucketing::compute_partition_keys(
+            &table,
+            &output_schema,
+            iceberg_config.scan.identity_partitioning_enabled,
+            iceberg_config.scan.bucket_execution_enabled,
+        );
 
         let (buckets, all_had_full_key) =
             bucketing::bucket_tasks(tasks, n_partitions, keys.as_ref());
@@ -255,18 +266,16 @@ impl TableProvider for IcebergTableProvider {
             _ => Partitioning::UnknownPartitioning(n_partitions),
         };
 
-        Ok(Arc::new(
-            IcebergTableScan::new_with_tasks_from_predicate(
-                table,
-                None, // Always use current snapshot for catalog-backed provider
-                self.schema.clone(),
-                projection,
-                predicate,
-                limit,
-                buckets,
-                partitioning,
-            )
-        ))
+        Ok(Arc::new(IcebergTableScan::new_with_tasks_from_predicate(
+            table,
+            None, // Always use current snapshot for catalog-backed provider
+            self.schema.clone(),
+            projection,
+            predicate,
+            limit,
+            buckets,
+            partitioning,
+        )))
     }
 
     fn supports_filters_pushdown(
@@ -475,8 +484,9 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::common::Column;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::SessionContext;
+    use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+    use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use iceberg::io::FileIO;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -987,8 +997,6 @@ mod tests {
         );
     }
 
-    // ── Bucketed scan tests ──────────────────────────────────────────────────
-
     async fn make_catalog_and_table_for_bucketing()
     -> (Arc<dyn Catalog>, NamespaceIdent, String, tempfile::TempDir) {
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -1087,8 +1095,18 @@ mod tests {
     }
 
     fn ctx_with_target_partitions(n: usize) -> SessionContext {
-        use datafusion::prelude::SessionConfig;
         SessionContext::new_with_config(SessionConfig::new().with_target_partitions(n))
+    }
+
+    fn ctx_with_target_partitions_and_iceberg_config(
+        n: usize,
+        iceberg_config: IcebergConfig,
+    ) -> SessionContext {
+        SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(n)
+                .with_option_extension(iceberg_config),
+        )
     }
 
     /// An empty table must produce a single empty-bucket scan so that DataFusion
@@ -1119,8 +1137,6 @@ mod tests {
     /// min(target_partitions, num_files).
     #[tokio::test]
     async fn test_unpartitioned_falls_back_to_unknown() {
-        use datafusion::physical_plan::Partitioning;
-
         let (catalog, namespace, table_name, _temp_dir) =
             make_catalog_and_table_for_bucketing().await;
         append_fake_data_files(&catalog, &namespace, &table_name, 5).await;
@@ -1293,13 +1309,10 @@ mod tests {
             .unwrap();
     }
 
-    /// Identity-partitioned table whose source column is in the projection
-    /// must produce `Partitioning::Hash` referencing that column.
+    /// Identity partitioning is planned from the session config, not cached on
+    /// the provider.
     #[tokio::test]
-    async fn test_identity_partitioned_declares_hash() {
-        use datafusion::physical_expr::expressions::Column;
-        use datafusion::physical_plan::Partitioning;
-
+    async fn test_identity_partitioned_uses_session_config() {
         let (catalog, namespace, table_name, _temp_dir) =
             make_partitioned_catalog_and_table_for_bucketing().await;
         append_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec![
@@ -1310,22 +1323,45 @@ mod tests {
         let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
             .await
             .unwrap();
-        let plan = provider
+
+        let default_plan = provider
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let default_scan = default_plan
+            .as_any()
+            .downcast_ref::<IcebergTableScan>()
+            .unwrap();
+        assert!(matches!(
+            default_scan.properties().partitioning,
+            Partitioning::UnknownPartitioning(3)
+        ));
 
-        let total_files: usize = scan.buckets().iter().map(|b| b.len()).sum();
-        assert_eq!(total_files, 6);
+        let identity_enabled_plan = provider
+            .scan(
+                &ctx_with_target_partitions_and_iceberg_config(
+                    3,
+                    IcebergConfig::default().with_identity_partitioning_enabled(true),
+                )
+                .state(),
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let identity_enabled_scan = identity_enabled_plan
+            .as_any()
+            .downcast_ref::<IcebergTableScan>()
+            .unwrap();
 
-        match &scan.properties().partitioning {
+        match &identity_enabled_scan.properties().partitioning {
             Partitioning::Hash(exprs, n) => {
                 assert_eq!(*n, 3);
                 assert_eq!(exprs.len(), 1);
                 let col = exprs[0]
                     .as_any()
-                    .downcast_ref::<Column>()
+                    .downcast_ref::<PhysicalColumn>()
                     .expect("expected Column expr");
                 assert_eq!(col.name(), "name");
             }
@@ -1337,8 +1373,6 @@ mod tests {
     /// `compute_identity_cols` to `None`, collapsing to `UnknownPartitioning`.
     #[tokio::test]
     async fn test_projection_without_partition_col_falls_back_to_unknown() {
-        use datafusion::physical_plan::Partitioning;
-
         let (catalog, namespace, table_name, _temp_dir) =
             make_partitioned_catalog_and_table_for_bucketing().await;
         append_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec!["a", "b"]).await;
@@ -1350,7 +1384,11 @@ mod tests {
         let projection = vec![0_usize];
         let plan = provider
             .scan(
-                &ctx_with_target_partitions(3).state(),
+                &ctx_with_target_partitions_and_iceberg_config(
+                    3,
+                    IcebergConfig::default().with_identity_partitioning_enabled(true),
+                )
+                .state(),
                 Some(&projection),
                 &[],
                 None,
@@ -1364,8 +1402,6 @@ mod tests {
             Partitioning::UnknownPartitioning(_)
         ));
     }
-
-    // ── Bucket-transform partitioning tests ─────────────────────────────────
 
     /// Build a table partitioned by `bucket[N](col)`. `transform` lets callers
     /// also build mixed-spec tables for negative tests.
@@ -1482,9 +1518,6 @@ mod tests {
     /// must declare `Partitioning::Hash` referencing that source column.
     #[tokio::test]
     async fn test_bucket_partitioned_declares_hash() {
-        use datafusion::physical_expr::expressions::Column;
-        use datafusion::physical_plan::Partitioning;
-
         let (catalog, namespace, table_name, _temp_dir) =
             make_bucket_partitioned_catalog_and_table_for_bucketing(8).await;
         append_bucket_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec![
@@ -1515,12 +1548,51 @@ mod tests {
                 assert_eq!(exprs.len(), 1);
                 let col = exprs[0]
                     .as_any()
-                    .downcast_ref::<Column>()
+                    .downcast_ref::<PhysicalColumn>()
                     .expect("expected Column expr");
                 assert_eq!(col.name(), "name");
             }
             other => panic!("expected Partitioning::Hash, got {other:?}"),
         }
+    }
+
+    /// Pure `Bucket[N]` specs use the optimized path by default, but disabling
+    /// bucket execution in the session must force the file-path fallback and
+    /// `UnknownPartitioning`.
+    #[tokio::test]
+    async fn test_bucket_partitioned_falls_back_to_unknown_when_disabled() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            make_bucket_partitioned_catalog_and_table_for_bucketing(8).await;
+        append_bucket_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(0),
+        ])
+        .await;
+
+        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let plan = provider
+            .scan(
+                &ctx_with_target_partitions_and_iceberg_config(
+                    4,
+                    IcebergConfig::default().with_bucket_execution_enabled(false),
+                )
+                .state(),
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+
+        assert!(matches!(
+            scan.properties().partitioning,
+            Partitioning::UnknownPartitioning(4)
+        ));
     }
 
     /// Single-column bucket spec where the projection excludes the *only*
@@ -1531,8 +1603,6 @@ mod tests {
     /// [`test_bucket_multi_column_partial_projection_declares_hash_on_subset`].
     #[tokio::test]
     async fn test_bucket_projection_drops_all_bucket_sources_falls_back_to_unknown() {
-        use datafusion::physical_plan::Partitioning;
-
         let (catalog, namespace, table_name, _temp_dir) =
             make_bucket_partitioned_catalog_and_table_for_bucketing(4).await;
         append_bucket_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec![
@@ -1568,8 +1638,6 @@ mod tests {
     /// whole scan to drop to `UnknownPartitioning`.
     #[tokio::test]
     async fn test_bucket_with_null_partition_value_falls_back_to_unknown() {
-        use datafusion::physical_plan::Partitioning;
-
         let (catalog, namespace, table_name, _temp_dir) =
             make_bucket_partitioned_catalog_and_table_for_bucketing(4).await;
         append_bucket_partitioned_fake_data_files(&catalog, &namespace, &table_name, vec![
@@ -1599,7 +1667,6 @@ mod tests {
     /// also yields zero columns. Final declaration is `UnknownPartitioning`.
     #[tokio::test]
     async fn test_mixed_bucket_and_other_transform_falls_back_to_unknown() {
-        use datafusion::physical_plan::Partitioning;
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
             DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
@@ -1689,7 +1756,16 @@ mod tests {
             .await
             .unwrap();
         let plan = provider
-            .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
+            .scan(
+                &ctx_with_target_partitions_and_iceberg_config(
+                    3,
+                    IcebergConfig::default().with_identity_partitioning_enabled(true),
+                )
+                .state(),
+                None,
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
@@ -1706,8 +1782,6 @@ mod tests {
     /// to multi-key hashes.
     #[tokio::test]
     async fn test_mixed_identity_and_bucket_keeps_identity_only_hash() {
-        use datafusion::physical_expr::expressions::Column;
-        use datafusion::physical_plan::Partitioning;
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
             DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
@@ -1809,7 +1883,16 @@ mod tests {
             .await
             .unwrap();
         let plan = provider
-            .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
+            .scan(
+                &ctx_with_target_partitions_and_iceberg_config(
+                    3,
+                    IcebergConfig::default().with_identity_partitioning_enabled(true),
+                )
+                .state(),
+                None,
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
@@ -1824,7 +1907,7 @@ mod tests {
                 );
                 let col = exprs[0]
                     .as_any()
-                    .downcast_ref::<Column>()
+                    .downcast_ref::<PhysicalColumn>()
                     .expect("expected Column expr");
                 assert_eq!(col.name(), "country");
             }
@@ -1944,7 +2027,6 @@ mod tests {
     /// `Partitioning::UnknownPartitioning`.
     #[tokio::test]
     async fn test_multi_column_bucket_falls_back_to_unknown() {
-        use datafusion::physical_plan::Partitioning;
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::spec::{
             DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,

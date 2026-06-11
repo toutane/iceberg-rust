@@ -186,13 +186,20 @@ impl PartitionKeys {
 pub(super) fn compute_partition_keys(
     table: &Table,
     output_schema: &ArrowSchema,
+    identity_partitioning_enabled: bool,
+    bucket_execution_enabled: bool,
 ) -> Option<PartitionKeys> {
-    if let Some(cols) = compute_identity_cols(table, output_schema)
+    if identity_partitioning_enabled
+        && let Some(cols) = compute_identity_cols(table, output_schema)
         && !cols.is_empty()
     {
         return Some(PartitionKeys::Identity(cols));
     }
-    compute_bucket_cols(table, output_schema).map(PartitionKeys::Bucket)
+    if bucket_execution_enabled {
+        compute_bucket_cols(table, output_schema).map(PartitionKeys::Bucket)
+    } else {
+        None
+    }
 }
 
 /// Group `tasks` into `n_partitions` buckets, one per DataFusion output
