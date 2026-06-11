@@ -39,9 +39,12 @@ use crate::to_datafusion_error;
 
 /// Iceberg [`Table`] scan as a DataFusion [`ExecutionPlan`].
 ///
-/// Has two construction modes: [`IcebergTableScan::new`] for a lazy
-/// single-partition scan, and [`IcebergTableScan::new_with_tasks`] for an
-/// eager multi-partition scan over pre-planned [`FileScanTask`] buckets.
+/// Has three construction modes: [`new`][Self::new] (lazy, single-partition),
+/// [`new_with_tasks`][Self::new_with_tasks] (eager, over pre-planned
+/// [`FileScanTask`] buckets), and
+/// [`new_with_tasks_from_predicate`][Self::new_with_tasks_from_predicate]
+/// (eager, from a [`Predicate`]) — the last lets a node be rebuilt from its
+/// getters, e.g. by a distributed-plan codec.
 ///
 /// Note: in eager mode the underlying `TableScan` is rebuilt on every
 /// `execute(partition)` call. The per-build cost is bounded (no I/O) and
@@ -57,6 +60,12 @@ pub struct IcebergTableScan {
     plan_properties: Arc<PlanProperties>,
     /// Projection column names, None means all columns.
     projection: Option<Vec<String>>,
+    /// Full schema before projection. Kept verbatim, not re-derived: the
+    /// provider caches it while reloading the table, so it can diverge from the
+    /// table's current metadata.
+    table_schema: ArrowSchemaRef,
+    /// Projection indices as received by `scan`; `projection` keeps only names.
+    projection_indices: Option<Vec<usize>>,
     /// Filters to apply to the table scan.
     predicates: Option<Predicate>,
     /// Pre-planned file scan tasks per partition (eager mode), or `None` (lazy mode).
@@ -84,7 +93,7 @@ impl IcebergTableScan {
             snapshot_id,
             schema,
             projection,
-            filters,
+            convert_filters_to_predicate(filters),
             limit,
             Partitioning::UnknownPartitioning(1),
             None,
@@ -111,7 +120,34 @@ impl IcebergTableScan {
             snapshot_id,
             schema,
             projection,
-            filters,
+            convert_filters_to_predicate(filters),
+            limit,
+            partitioning,
+            Some(buckets),
+        )
+    }
+
+    /// Eager variant taking a [`Predicate`] instead of [`Expr`] filters, so a
+    /// node can be rebuilt from its getters. The predicate is unbound; the scan
+    /// builder binds it at `execute` time.
+    // Arity mirrors `new_with_tasks`; an args struct is deferred.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tasks_from_predicate(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&Vec<usize>>,
+        predicate: Option<Predicate>,
+        limit: Option<usize>,
+        buckets: Vec<Vec<FileScanTask>>,
+        partitioning: Partitioning,
+    ) -> Self {
+        Self::new_inner(
+            table,
+            snapshot_id,
+            schema,
+            projection,
+            predicate,
             limit,
             partitioning,
             Some(buckets),
@@ -124,7 +160,7 @@ impl IcebergTableScan {
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        predicate: Option<Predicate>,
         limit: Option<usize>,
         partitioning: Partitioning,
         buckets: Option<Vec<Vec<FileScanTask>>>,
@@ -139,15 +175,18 @@ impl IcebergTableScan {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let table_schema = Arc::clone(&schema);
+        let projection_indices = projection.cloned();
         let projection = get_column_names(schema, projection);
-        let predicates = convert_filters_to_predicate(filters);
 
         Self {
             table,
             snapshot_id,
             plan_properties,
             projection,
-            predicates,
+            table_schema,
+            projection_indices,
+            predicates: predicate,
             buckets,
             partition_keys_kind: None,
             limit,
@@ -166,12 +205,20 @@ impl IcebergTableScan {
         &self.table
     }
 
+    pub fn table_schema(&self) -> &ArrowSchemaRef {
+        &self.table_schema
+    }
+
     pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
     }
 
     pub fn projection(&self) -> Option<&[String]> {
         self.projection.as_deref()
+    }
+
+    pub fn projection_indices(&self) -> Option<&[usize]> {
+        self.projection_indices.as_deref()
     }
 
     pub fn predicates(&self) -> Option<&Predicate> {
@@ -382,4 +429,135 @@ pub(super) fn get_column_names(
             .map(|p| schema.field(*p).name().clone())
             .collect::<Vec<String>>()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::{Expr, col, lit};
+    use iceberg::TableIdent;
+    use iceberg::expr::Reference;
+    use iceberg::io::FileIO;
+    use iceberg::spec::Datum;
+    use iceberg::table::{StaticTable, Table};
+
+    use super::*;
+
+    async fn test_table() -> Table {
+        let metadata_path = format!(
+            "{}/tests/test_data/TableMetadataV2Valid.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let ident = TableIdent::from_strs(["ns", "scan_table"]).unwrap();
+        StaticTable::from_metadata_file(&metadata_path, ident, FileIO::new_with_fs())
+            .await
+            .unwrap()
+            .into_table()
+    }
+
+    fn arrow_schema() -> ArrowSchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+            Field::new("z", DataType::Int64, false),
+        ]))
+    }
+
+    fn filters() -> Vec<Expr> {
+        vec![col("x").gt(lit(5i64))]
+    }
+
+    // The Expr and predicate constructors must agree: `new_with_tasks` only
+    // pre-converts the filters that `new_with_tasks_from_predicate` takes raw.
+    #[tokio::test]
+    async fn expr_and_predicate_constructors_agree() {
+        let table = test_table().await;
+        let projection = vec![0usize, 2];
+        let from_filters = IcebergTableScan::new_with_tasks(
+            table.clone(),
+            None,
+            arrow_schema(),
+            Some(&projection),
+            &filters(),
+            Some(100),
+            vec![vec![], vec![]],
+            Partitioning::UnknownPartitioning(2),
+        );
+        let from_predicate = IcebergTableScan::new_with_tasks_from_predicate(
+            table,
+            None,
+            arrow_schema(),
+            Some(&projection),
+            convert_filters_to_predicate(&filters()),
+            Some(100),
+            vec![vec![], vec![]],
+            Partitioning::UnknownPartitioning(2),
+        );
+
+        assert_eq!(from_filters.predicates(), from_predicate.predicates());
+        assert_eq!(from_filters.projection(), from_predicate.projection());
+        assert_eq!(
+            from_filters.schema().fields(),
+            from_predicate.schema().fields()
+        );
+        assert_eq!(
+            format!("{:?}", from_filters.properties().output_partitioning()),
+            format!("{:?}", from_predicate.properties().output_partitioning()),
+        );
+    }
+
+    // table_schema() exposes the full pre-projection schema; schema() is projected.
+    #[tokio::test]
+    async fn getters_expose_full_schema_and_indices() {
+        let projection = vec![0usize, 2];
+        let scan = IcebergTableScan::new(
+            test_table().await,
+            None,
+            arrow_schema(),
+            Some(&projection),
+            &[],
+            None,
+        );
+
+        assert_eq!(scan.table_schema().fields(), arrow_schema().fields());
+        assert_eq!(scan.table_schema().fields().len(), 3);
+        assert_eq!(scan.schema().fields().len(), 2);
+        assert_ne!(scan.schema().fields(), scan.table_schema().fields());
+
+        assert_eq!(scan.projection_indices(), Some(projection.as_slice()));
+        let names = ["x".to_string(), "z".to_string()];
+        assert_eq!(scan.projection(), Some(names.as_slice()));
+    }
+
+    // Without a projection, indices/names are None and the full schema is kept.
+    #[tokio::test]
+    async fn no_projection_keeps_full_schema() {
+        let scan = IcebergTableScan::new(test_table().await, None, arrow_schema(), None, &[], None);
+
+        assert_eq!(scan.projection_indices(), None);
+        assert_eq!(scan.projection(), None);
+        assert_eq!(scan.schema().fields(), scan.table_schema().fields());
+        assert_eq!(scan.table_schema().fields(), arrow_schema().fields());
+    }
+
+    // A predicate passed to the new constructor round-trips unchanged.
+    #[tokio::test]
+    async fn predicate_round_trips() {
+        let predicate = Reference::new("x").greater_than(Datum::long(5));
+        let scan = IcebergTableScan::new_with_tasks_from_predicate(
+            test_table().await,
+            None,
+            arrow_schema(),
+            None,
+            Some(predicate.clone()),
+            None,
+            vec![vec![]],
+            Partitioning::UnknownPartitioning(1),
+        );
+
+        assert_eq!(scan.predicates(), Some(&predicate));
+    }
 }

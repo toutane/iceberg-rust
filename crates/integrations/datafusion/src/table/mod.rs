@@ -208,8 +208,8 @@ impl TableProvider for IcebergTableProvider {
             Some(names) => builder.select(names),
             None => builder.select_all(),
         };
-        if let Some(pred) = predicate {
-            builder = builder.with_filter(pred);
+        if let Some(pred) = &predicate {
+            builder = builder.with_filter(pred.clone());
         }
 
         let tasks: Vec<FileScanTask> = builder
@@ -258,12 +258,12 @@ impl TableProvider for IcebergTableProvider {
         };
 
         Ok(Arc::new(
-            IcebergTableScan::new_with_tasks(
+            IcebergTableScan::new_with_tasks_from_predicate(
                 table,
                 None, // Always use current snapshot for catalog-backed provider
                 self.schema.clone(),
                 projection,
-                filters,
+                predicate,
                 limit,
                 buckets,
                 partitioning,
