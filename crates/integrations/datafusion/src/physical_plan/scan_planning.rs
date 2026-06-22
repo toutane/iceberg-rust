@@ -17,12 +17,21 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::datatypes::{
+    DataType, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit,
+};
+use datafusion::common::hash_utils::create_hashes;
 use datafusion::error::Result as DFResult;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::Partitioning;
+use datafusion::physical_plan::repartition::REPARTITION_RANDOM_STATE;
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
+use iceberg::arrow::PrimitiveLiteralArrayBuilder;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, TableScan};
+use iceberg::spec::{Literal, Transform};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -38,6 +47,25 @@ pub struct IcebergScanConfig {
     column_names: Option<Vec<String>>,
     /// Filters to apply to the table scan.
     predicates: Option<Predicate>,
+}
+
+#[derive(Debug)]
+pub struct PlannedFileTaskGroups {
+    pub groups: Vec<Vec<FileScanTask>>,
+    pub partitioning: Partitioning,
+}
+
+/// Identity-partitioned column that is also present in the output projection
+/// and whose Arrow type can be reconstructed from a `Literal` for hashing.
+struct IdentityHashColumn {
+    partition_spec_id: i32,
+    name: String,
+    /// Position of this column in the *output* schema (after projection).
+    output_idx: usize,
+    /// Position of this column inside the partition spec's `fields()` slice,
+    /// matching the slot order of `FileScanTask::partition`.
+    spec_field_idx: usize,
+    output_dtype: DataType,
 }
 
 impl IcebergScanConfig {
@@ -81,7 +109,7 @@ pub(crate) async fn plan_file_task_groups(
     table: &Table,
     scan_config: &IcebergScanConfig,
     target_partitions: usize,
-) -> DFResult<Vec<Vec<FileScanTask>>> {
+) -> DFResult<PlannedFileTaskGroups> {
     // Do not cache planned FileScanTasks in the provider in v1. They are query-specific
     // because projection, predicate binding, snapshot schema, and delete planning can differ
     // between scans. Catalog-backed providers also need fresh metadata on each scan.
@@ -94,7 +122,216 @@ pub(crate) async fn plan_file_task_groups(
         .await
         .map_err(to_datafusion_error)?;
 
-    Ok(group_file_scan_tasks_by_size(tasks, target_partitions))
+    let output_schema = scan_config.output_schema();
+    Ok(plan_task_groups_from_tasks(
+        table,
+        output_schema.as_ref(),
+        tasks,
+        target_partitions,
+    ))
+}
+
+fn plan_task_groups_from_tasks(
+    table: &Table,
+    output_schema: &ArrowSchema,
+    tasks: Vec<FileScanTask>,
+    target_partitions: usize,
+) -> PlannedFileTaskGroups {
+    if !tasks.is_empty()
+        && let Some(identity_cols) = find_identity_hash_columns(table, output_schema)
+    {
+        let partition_count = target_partitions.min(tasks.len()).max(1);
+        // Hash on a borrow first so that, on success, the tasks can be moved
+        // (not cloned) into their target buckets.
+        if let Some(hashes) = identity_hashes_for_tasks(&tasks, &identity_cols) {
+            let mut groups: Vec<Vec<FileScanTask>> = vec![Vec::new(); partition_count];
+            for (task, hash) in tasks.into_iter().zip(hashes) {
+                groups[(hash % partition_count as u64) as usize].push(task);
+            }
+            let hash_exprs = identity_cols
+                .iter()
+                .map(|col| {
+                    Arc::new(Column::new(&col.name, col.output_idx)) as Arc<dyn PhysicalExpr>
+                })
+                .collect();
+            return PlannedFileTaskGroups {
+                groups,
+                partitioning: Partitioning::Hash(hash_exprs, partition_count),
+            };
+        }
+    }
+
+    let groups = group_file_scan_tasks_by_size(tasks, target_partitions);
+    let partition_count = groups.len();
+    PlannedFileTaskGroups {
+        groups,
+        partitioning: Partitioning::UnknownPartitioning(partition_count),
+    }
+}
+
+/// Inspect the table's default partition spec and return the list of identity
+/// columns that can support a [`Partitioning::Hash`] declaration. Returns
+/// `None` if any condition is violated:
+///   - the spec has no identity-transform field at all
+///   - the source column for an identity field is not in the output projection
+///   - the source column's Arrow type is not currently supported by
+///     the identity hash materialization path
+///   - the table has spec evolution (>1 historical specs), since older files
+///     may carry a partition tuple that does not align with the default spec
+///
+/// Returning `None` forces the scan to declare `UnknownPartitioning` even if
+/// bucketing succeeds.
+fn find_identity_hash_columns(
+    table: &Table,
+    output_schema: &ArrowSchema,
+) -> Option<Vec<IdentityHashColumn>> {
+    let metadata = table.metadata();
+    // iceberg-java is less conservative here: it intersects the identity fields
+    // present in every spec (`Partitioning.groupingKeyType` /
+    // `commonActiveFieldIds`) and still reports a grouping key on the columns
+    // that are identity-partitioned across all of them. We deliberately bail
+    // out on any spec evolution instead, because the bucketing path aligns each
+    // task's partition slot to the *default* spec and `FileScanTask` does not
+    // yet carry its own spec id to disambiguate. Tracked as a follow-up in
+    // <https://github.com/apache/iceberg-rust/issues/2658>.
+    if metadata.partition_specs_iter().len() != 1 {
+        return None;
+    }
+
+    // Be conservative under schema evolution: the scan output schema can come
+    // from a historical snapshot or from a provider-cached pre-evolution schema,
+    // while the lookup below uses names from `metadata.current_schema()`. Under
+    // rename/name reuse this can advertise hash partitioning for the wrong
+    // output column. TODO: allow schema evolution here once identity columns
+    // are matched by Iceberg field id metadata instead of current field name.
+    if metadata.schemas_iter().len() != 1 {
+        return None;
+    }
+
+    let table_schema = metadata.current_schema();
+    let mut columns = Vec::new();
+    for (spec_field_idx, partition_field) in metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .enumerate()
+    {
+        if partition_field.transform != Transform::Identity {
+            continue;
+        }
+
+        let source_field = table_schema.field_by_id(partition_field.source_id)?;
+        let source_path = table_schema.name_by_field_id(partition_field.source_id)?;
+        if source_path.contains('.') {
+            // TODO: Support hash partitioning for nested identity fields by
+            // advertising partitioning on the exact nested output expression.
+            // Matching by leaf name is unsafe when a top-level column shares it.
+            return None;
+        }
+
+        let output_idx = output_schema.index_of(source_field.name.as_str()).ok()?;
+        let output_field = output_schema.field(output_idx);
+        if !is_supported_identity_hash_dtype(output_field.data_type()) {
+            return None;
+        }
+
+        columns.push(IdentityHashColumn {
+            partition_spec_id: metadata.default_partition_spec().spec_id(),
+            name: output_field.name().clone(),
+            output_idx,
+            spec_field_idx,
+            output_dtype: output_field.data_type().clone(),
+        });
+    }
+
+    if columns.is_empty() {
+        return None;
+    }
+
+    Some(columns)
+}
+
+fn is_supported_identity_hash_dtype(data_type: &DataType) -> bool {
+    // Correctness here relies on the stored partition literal hashing identically
+    // to the data column DataFusion sees at runtime. DataFusion hashes the
+    // physical value (integer/native bits), so for floats the hash is over the
+    // raw byte pattern: `+0.0`/`-0.0` and distinct NaN encodings hash differently.
+    // This holds for a correctly written identity partition (the literal equals
+    // every row's value bit-for-bit), but float identity keys are unusual; revisit
+    // if a writer is found to normalize partition floats (e.g. `-0.0` -> `0.0`)
+    // without rewriting the data, as that would split a key across partitions.
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+            | DataType::Timestamp(TimeUnit::Nanosecond, _)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Decimal128(_, _)
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+/// Hash all identity-partition values using [`REPARTITION_RANDOM_STATE`] so the
+/// bucket assignment matches DataFusion's hash-repartition convention.
+fn identity_hashes_for_tasks(
+    tasks: &[FileScanTask],
+    identity_cols: &[IdentityHashColumn],
+) -> Option<Vec<u64>> {
+    if identity_cols.is_empty() {
+        return None;
+    }
+
+    let mut builders = identity_cols
+        .iter()
+        .map(|col| PrimitiveLiteralArrayBuilder::try_new(&col.output_dtype, tasks.len()))
+        .collect::<iceberg::Result<Vec<_>>>()
+        .ok()?;
+    let partition_spec_id = identity_cols.first()?.partition_spec_id;
+
+    for task in tasks {
+        if let Some(partition_spec) = task.partition_spec.as_ref()
+            && partition_spec.spec_id() != partition_spec_id
+        {
+            return None;
+        }
+
+        let partition = task.partition.as_ref()?;
+        for (builder, identity_col) in builders.iter_mut().zip(identity_cols) {
+            let Some(Literal::Primitive(primitive)) = partition
+                .fields()
+                .get(identity_col.spec_field_idx)?
+                .as_ref()
+            else {
+                return None;
+            };
+            if !builder.append_or_null(Some(primitive)).ok()? {
+                return None;
+            }
+        }
+    }
+
+    let arrays = builders
+        .into_iter()
+        .map(PrimitiveLiteralArrayBuilder::finish)
+        .collect::<iceberg::Result<Vec<_>>>()
+        .ok()?;
+    let mut hashes = vec![0; tasks.len()];
+    create_hashes(
+        &arrays,
+        REPARTITION_RANDOM_STATE.random_state(),
+        &mut hashes,
+    )
+    .ok()?;
+    Some(hashes)
 }
 
 fn get_column_names(
