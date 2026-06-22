@@ -409,7 +409,18 @@ pub(crate) fn build_table_scan(
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use datafusion::arrow::datatypes::Field;
+    use iceberg::TableIdent;
+    use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{
+        DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema,
+        SortOrder, Struct, StructType, TableMetadata, TableMetadataBuilder, Transform, Type,
+        UnboundPartitionSpec,
+    };
+    use iceberg::table::Table;
+    use iceberg::test_utils::test_runtime;
 
     use super::*;
 
@@ -432,10 +443,6 @@ mod tests {
             .with_project_field_ids(vec![1])
             .with_case_sensitive(true)
             .build()
-    }
-
-    fn task_paths(tasks: &[FileScanTask]) -> Vec<&str> {
-        tasks.iter().map(|task| task.data_file_path()).collect()
     }
 
     fn group_bytes(groups: &[Vec<FileScanTask>]) -> Vec<u64> {
@@ -508,5 +515,417 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert!(groups[0].is_empty());
+    }
+
+    fn identity_partitioned_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn identity_partition_spec(schema: Schema) -> PartitionSpec {
+        PartitionSpec::builder(schema)
+            .add_partition_field("category", "category", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn table_from_metadata(metadata: TableMetadata, name: &str) -> Table {
+        let table_location = format!("/test/{name}");
+
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["test", name]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .metadata_location(format!("{table_location}_metadata.json"))
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    fn identity_partitioned_table() -> Table {
+        let schema = identity_partitioned_schema();
+        let partition_spec = identity_partition_spec(schema.clone());
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/identity_partitioned".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        table_from_metadata(table_metadata.metadata, "identity_partitioned")
+    }
+
+    fn identity_partitioned_table_with_schema_evolution() -> Table {
+        let schema = identity_partitioned_schema();
+        let partition_spec = identity_partition_spec(schema.clone());
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let evolved_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "description", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/identity_schema_evolution".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .add_current_schema(evolved_schema)
+        .unwrap()
+        .build()
+        .unwrap();
+
+        table_from_metadata(table_metadata.metadata, "identity_schema_evolution")
+    }
+
+    fn identity_partitioned_table_with_partition_spec_evolution() -> Table {
+        let schema = identity_partitioned_schema();
+        let partition_spec = identity_partition_spec(schema.clone());
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let added_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(1, "id_bucket", Transform::Bucket(8))
+            .unwrap()
+            .build();
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/identity_spec_evolution".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .add_partition_spec(added_spec)
+        .unwrap()
+        .build()
+        .unwrap();
+
+        table_from_metadata(table_metadata.metadata, "identity_spec_evolution")
+    }
+
+    fn nested_identity_partition_table() -> Table {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(2, "x", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+                NestedField::required(3, "x", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("s.x", "s_x", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/nested_identity_collision".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        Table::builder()
+            .metadata(table_metadata.metadata)
+            .identifier(TableIdent::from_strs(["test", "nested_identity_collision"]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .metadata_location("/test/nested_identity_collision_metadata.json")
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    fn identity_partition_task(table: &Table, path: &str, category: &str) -> FileScanTask {
+        identity_partition_task_with_partition(
+            table,
+            path,
+            Some(Struct::from_iter([Some(Literal::string(category))])),
+        )
+    }
+
+    fn identity_partition_task_with_partition(
+        table: &Table,
+        path: &str,
+        partition: Option<Struct>,
+    ) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(1)
+            .with_record_count(Some(1))
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table.metadata().current_schema().clone())
+            .with_project_field_ids(vec![1, 2])
+            .with_partition(partition)
+            .with_partition_spec(Some(table.metadata().default_partition_spec().clone()))
+            .with_case_sensitive(true)
+            .build()
+    }
+
+    fn task_paths(tasks: &[FileScanTask]) -> Vec<&str> {
+        tasks.iter().map(|task| task.data_file_path()).collect()
+    }
+
+    fn assert_unknown_partitioning(
+        planned: PlannedFileTaskGroups,
+        expected_partition_count: usize,
+    ) {
+        match planned.partitioning {
+            Partitioning::UnknownPartitioning(partition_count) => {
+                assert_eq!(partition_count, expected_partition_count);
+            }
+            other => panic!("expected unknown partitioning, got {other:?}"),
+        }
+        assert_eq!(planned.groups.len(), expected_partition_count);
+    }
+
+    #[test]
+    fn nested_identity_partition_does_not_match_top_level_name_collision() {
+        let table = nested_identity_partition_table();
+        let table_arrow_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let top_level_x_idx = table_arrow_schema.index_of("x").unwrap();
+        let output_schema =
+            ArrowSchema::new(vec![table_arrow_schema.field(top_level_x_idx).clone()]);
+
+        assert_eq!(output_schema.field(0).name(), "x");
+        assert!(
+            find_identity_hash_columns(&table, &output_schema).is_none(),
+            "nested identity partition field s.x must not advertise hash partitioning for top-level x"
+        );
+    }
+
+    #[test]
+    fn test_identity_partitioned_tasks_declare_hash_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task(&table, "/test/b.parquet", "b"),
+            identity_partition_task(&table, "/test/c.parquet", "c"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 8);
+
+        match planned.partitioning {
+            Partitioning::Hash(exprs, partition_count) => {
+                assert_eq!(partition_count, 3);
+                assert_eq!(exprs.len(), 1);
+                let column = exprs[0].downcast_ref::<Column>().unwrap();
+                assert_eq!(column.name(), "category");
+                assert_eq!(column.index(), 1);
+            }
+            other => panic!("expected hash partitioning, got {other:?}"),
+        }
+        assert_eq!(planned.groups.len(), 3);
+    }
+
+    // NOTE: The hash-equivalence tests below (planner buckets == DataFusion
+    // `RepartitionExec` buckets) intentionally cover only a representative subset
+    // of identity-partition dtypes: Utf8, Decimal128, and Timestamp. Exhaustive
+    // per-dtype coverage for the rest of `is_supported_identity_hash_dtype` — in
+    // particular the byte-reconstruction paths (Uuid / Fixed -> FixedSizeBinary,
+    // Binary / LargeBinary) plus Date32, Time64, Boolean, Float, and timezone'd
+    // Timestamp — is deferred to a follow-up PR.
+    #[test]
+    fn test_identity_partitioned_hash_task_groups_match_datafusion_repartition() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let categories = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let tasks = categories
+            .iter()
+            .enumerate()
+            .map(|(idx, category)| {
+                identity_partition_task(&table, &format!("/test/{idx}.parquet"), category)
+            })
+            .collect::<Vec<_>>();
+        let partition_count = 3;
+
+        let planned =
+            plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), partition_count);
+
+        let category_array = Arc::new(StringArray::from_iter_values(categories)) as ArrayRef;
+        let mut hashes = vec![0; categories.len()];
+        create_hashes(
+            &[category_array],
+            REPARTITION_RANDOM_STATE.random_state(),
+            &mut hashes,
+        )
+        .unwrap();
+
+        let mut expected_paths_by_bucket = vec![Vec::new(); partition_count];
+        for (task, hash) in tasks.iter().zip(hashes) {
+            expected_paths_by_bucket[(hash % partition_count as u64) as usize]
+                .push(task.data_file_path());
+        }
+        let actual_paths_by_bucket = planned
+            .groups
+            .iter()
+            .map(|group| task_paths(group))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_paths_by_bucket, expected_paths_by_bucket);
+    }
+
+    #[test]
+    fn test_identity_partitioned_projection_without_identity_column_uses_unknown_partitioning() {
+        let table = identity_partitioned_table();
+        let table_arrow_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let id_idx = table_arrow_schema.index_of("id").unwrap();
+        let output_schema = ArrowSchema::new(vec![table_arrow_schema.field(id_idx).clone()]);
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task(&table, "/test/b.parquet", "b"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_schema_evolution_uses_unknown_partitioning() {
+        let table = identity_partitioned_table_with_schema_evolution();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task(&table, "/test/b.parquet", "b"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_spec_evolution_uses_unknown_partitioning() {
+        let table = identity_partitioned_table_with_partition_spec_evolution();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task(&table, "/test/b.parquet", "b"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_task_without_partition_uses_unknown_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task_with_partition(&table, "/test/no-partition.parquet", None),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_null_partition_value_uses_unknown_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task_with_partition(
+                &table,
+                "/test/null.parquet",
+                Some(Struct::from_iter([None::<Literal>])),
+            ),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_non_primitive_partition_value_uses_unknown_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task_with_partition(
+                &table,
+                "/test/list.parquet",
+                Some(Struct::from_iter([Some(Literal::List(vec![]))])),
+            ),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_mismatched_partition_value_uses_unknown_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task_with_partition(
+                &table,
+                "/test/int.parquet",
+                Some(Struct::from_iter([Some(Literal::int(1))])),
+            ),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    #[test]
+    fn test_identity_partitioned_unsupported_output_dtype_uses_unknown_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = ArrowSchema::new(vec![Field::new(
+            "category",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]);
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task(&table, "/test/b.parquet", "b"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+
+        assert_unknown_partitioning(planned, 2);
     }
 }
