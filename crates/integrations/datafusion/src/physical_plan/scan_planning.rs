@@ -409,7 +409,9 @@ pub(crate) fn build_table_scan(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use datafusion::arrow::array::{
+        ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray,
+    };
     use datafusion::arrow::datatypes::Field;
     use iceberg::TableIdent;
     use iceberg::arrow::schema_to_arrow_schema;
@@ -567,6 +569,52 @@ mod tests {
         table_from_metadata(table_metadata.metadata, "identity_partitioned")
     }
 
+    fn decimal_timestamp_identity_partitioned_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "price",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 18,
+                        scale: 2,
+                    }),
+                )
+                .into(),
+                NestedField::required(2, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn decimal_timestamp_identity_partitioned_table() -> Table {
+        let schema = decimal_timestamp_identity_partitioned_schema();
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("price", "price", Transform::Identity)
+            .unwrap()
+            .add_partition_field("ts", "ts", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/decimal_timestamp_identity_partitioned".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        table_from_metadata(
+            table_metadata.metadata,
+            "decimal_timestamp_identity_partitioned",
+        )
+    }
+
     fn identity_partitioned_table_with_schema_evolution() -> Table {
         let schema = identity_partitioned_schema();
         let partition_spec = identity_partition_spec(schema.clone());
@@ -695,6 +743,30 @@ mod tests {
             .build()
     }
 
+    fn decimal_timestamp_identity_partition_task(
+        table: &Table,
+        path: &str,
+        price: i128,
+        ts: i64,
+    ) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(1)
+            .with_record_count(Some(1))
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table.metadata().current_schema().clone())
+            .with_project_field_ids(vec![1, 2])
+            .with_partition(Some(Struct::from_iter([
+                Some(Literal::decimal(price)),
+                Some(Literal::timestamp(ts)),
+            ])))
+            .with_partition_spec(Some(table.metadata().default_partition_spec().clone()))
+            .with_case_sensitive(true)
+            .build()
+    }
+
     fn task_paths(tasks: &[FileScanTask]) -> Vec<&str> {
         tasks.iter().map(|task| task.data_file_path()).collect()
     }
@@ -788,6 +860,73 @@ mod tests {
         let mut expected_paths_by_bucket = vec![Vec::new(); partition_count];
         for (task, hash) in tasks.iter().zip(hashes) {
             expected_paths_by_bucket[(hash % partition_count as u64) as usize]
+                .push(task.data_file_path());
+        }
+        let actual_paths_by_bucket = planned
+            .groups
+            .iter()
+            .map(|group| task_paths(group))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_paths_by_bucket, expected_paths_by_bucket);
+    }
+
+    #[test]
+    fn test_identity_partitioned_decimal_timestamp_hash_task_groups_match_datafusion_repartition() {
+        let table = decimal_timestamp_identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let rows = [
+            (100_i128, 1_740_600_000_000_000_i64),
+            (200_i128, 1_740_600_100_000_000_i64),
+            (100_i128, 1_740_600_200_000_000_i64),
+        ];
+        let tasks = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, (price, ts))| {
+                decimal_timestamp_identity_partition_task(
+                    &table,
+                    &format!("/test/{idx}.parquet"),
+                    *price,
+                    *ts,
+                )
+            })
+            .collect::<Vec<_>>();
+        let partition_count = 4;
+
+        let planned =
+            plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), partition_count);
+
+        let bucket_count = planned.partitioning.partition_count();
+        match &planned.partitioning {
+            Partitioning::Hash(exprs, partition_count) => {
+                assert_eq!(*partition_count, 3);
+                assert_eq!(exprs.len(), 2);
+            }
+            other => panic!("expected hash partitioning, got {other:?}"),
+        }
+
+        let price_array =
+            Decimal128Array::from(rows.iter().map(|(price, _)| *price).collect::<Vec<_>>())
+                .with_precision_and_scale(18, 2)
+                .unwrap();
+        let ts_array =
+            TimestampMicrosecondArray::from(rows.iter().map(|(_, ts)| *ts).collect::<Vec<_>>());
+        let arrays = vec![
+            Arc::new(price_array) as ArrayRef,
+            Arc::new(ts_array) as ArrayRef,
+        ];
+        let mut hashes = vec![0; rows.len()];
+        create_hashes(
+            &arrays,
+            REPARTITION_RANDOM_STATE.random_state(),
+            &mut hashes,
+        )
+        .unwrap();
+
+        let mut expected_paths_by_bucket = vec![Vec::new(); bucket_count];
+        for (task, hash) in tasks.iter().zip(hashes) {
+            expected_paths_by_bucket[(hash % bucket_count as u64) as usize]
                 .push(task.data_file_path());
         }
         let actual_paths_by_bucket = planned
@@ -914,18 +1053,23 @@ mod tests {
     #[test]
     fn test_identity_partitioned_unsupported_output_dtype_uses_unknown_partitioning() {
         let table = identity_partitioned_table();
-        let output_schema = ArrowSchema::new(vec![Field::new(
-            "category",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        )]);
         let tasks = vec![
             identity_partition_task(&table, "/test/a.parquet", "a"),
             identity_partition_task(&table, "/test/b.parquet", "b"),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        for category_field in [
+            Field::new(
+                "category",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new("category", DataType::Utf8View, true),
+        ] {
+            let output_schema = ArrowSchema::new(vec![category_field]);
+            let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), 4);
 
-        assert_unknown_partitioning(planned, 2);
+            assert_unknown_partitioning(planned, 2);
+        }
     }
 }
