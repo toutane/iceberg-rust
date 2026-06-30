@@ -109,6 +109,7 @@ pub(crate) async fn plan_file_task_groups(
     table: &Table,
     scan_config: &IcebergScanConfig,
     target_partitions: usize,
+    enable_identity_partitioning: bool,
 ) -> DFResult<PlannedFileTaskGroups> {
     // Do not cache planned FileScanTasks in the provider in v1. They are query-specific
     // because projection, predicate binding, snapshot schema, and delete planning can differ
@@ -128,6 +129,7 @@ pub(crate) async fn plan_file_task_groups(
         output_schema.as_ref(),
         tasks,
         target_partitions,
+        enable_identity_partitioning,
     ))
 }
 
@@ -136,8 +138,10 @@ fn plan_task_groups_from_tasks(
     output_schema: &ArrowSchema,
     tasks: Vec<FileScanTask>,
     target_partitions: usize,
+    enable_identity_partitioning: bool,
 ) -> PlannedFileTaskGroups {
-    if !tasks.is_empty()
+    if enable_identity_partitioning
+        && !tasks.is_empty()
         && let Some(identity_cols) = find_identity_hash_columns(table, output_schema)
     {
         let partition_count = target_partitions.min(tasks.len()).max(1);
@@ -410,19 +414,22 @@ pub(crate) fn build_table_scan(
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{
-        ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        StringArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use datafusion::arrow::datatypes::Field;
     use iceberg::TableIdent;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIO;
     use iceberg::spec::{
-        DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema,
-        SortOrder, Struct, StructType, TableMetadata, TableMetadataBuilder, Transform, Type,
-        UnboundPartitionSpec,
+        DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
+        Schema, SortOrder, Struct, StructType, TableMetadata, TableMetadataBuilder, Transform,
+        Type, UnboundPartitionSpec,
     };
     use iceberg::table::Table;
     use iceberg::test_utils::test_runtime;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -548,6 +555,124 @@ mod tests {
             .runtime(test_runtime())
             .build()
             .unwrap()
+    }
+
+    /// Table with a single required column `v` (field id 1), identity-partitioned on `v`.
+    fn single_identity_column_table(name: &str, column_type: Type) -> Table {
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(1, "v", column_type).into()])
+            .build()
+            .unwrap();
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("v", "v", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            format!("/test/{name}"),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        table_from_metadata(table_metadata.metadata, name)
+    }
+
+    fn single_identity_task(table: &Table, path: &str, value: Literal) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(1)
+            .with_record_count(Some(1))
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table.metadata().current_schema().clone())
+            .with_project_field_ids(vec![1])
+            .with_partition(Some(Struct::from_iter([Some(value)])))
+            .with_partition_spec(Some(table.metadata().default_partition_spec().clone()))
+            .with_case_sensitive(true)
+            .build()
+    }
+
+    /// Assert the planner's identity-hash bucketing matches DataFusion's
+    /// `RepartitionExec` for a single identity column. `output_dtype` is explicit so
+    /// arms not produced by `schema_to_arrow_schema` (`Binary`, `LargeUtf8`) are
+    /// reachable; `expected_array` is what DataFusion would hash at runtime, in task order.
+    fn assert_identity_hash_equivalence(
+        name: &str,
+        column_type: Type,
+        output_dtype: DataType,
+        partition_values: Vec<Literal>,
+        expected_array: ArrayRef,
+        target_partitions: usize,
+    ) {
+        let row_count = partition_values.len();
+        assert_eq!(
+            row_count,
+            expected_array.len(),
+            "{name}: one expected array element per partition value"
+        );
+
+        let table = single_identity_column_table(name, column_type);
+        let output_schema = ArrowSchema::new(vec![Field::new("v", output_dtype, true)]);
+
+        let tasks = partition_values
+            .into_iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                single_identity_task(&table, &format!("/test/{idx}.parquet"), value)
+            })
+            .collect::<Vec<_>>();
+
+        let planned = plan_task_groups_from_tasks(
+            &table,
+            &output_schema,
+            tasks.clone(),
+            target_partitions,
+            true,
+        );
+
+        let partition_count = match &planned.partitioning {
+            Partitioning::Hash(exprs, partition_count) => {
+                assert_eq!(
+                    exprs.len(),
+                    1,
+                    "{name}: expected a single identity hash column"
+                );
+                *partition_count
+            }
+            other => panic!("{name}: expected hash partitioning, got {other:?}"),
+        };
+
+        let mut hashes = vec![0; row_count];
+        create_hashes(
+            &[expected_array],
+            REPARTITION_RANDOM_STATE.random_state(),
+            &mut hashes,
+        )
+        .unwrap();
+
+        let mut expected_paths_by_bucket = vec![Vec::new(); partition_count];
+        for (task, hash) in tasks.iter().zip(hashes) {
+            expected_paths_by_bucket[(hash % partition_count as u64) as usize]
+                .push(task.data_file_path());
+        }
+        let actual_paths_by_bucket = planned
+            .groups
+            .iter()
+            .map(|group| task_paths(group))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual_paths_by_bucket, expected_paths_by_bucket,
+            "{name}: planner bucket assignment must match DataFusion repartition"
+        );
     }
 
     fn identity_partitioned_table() -> Table {
@@ -723,6 +848,16 @@ mod tests {
         )
     }
 
+    fn identity_partition_task_without_partition_spec(
+        table: &Table,
+        path: &str,
+        category: &str,
+    ) -> FileScanTask {
+        let mut task = identity_partition_task(table, path, category);
+        task.partition_spec = None;
+        task
+    }
+
     fn identity_partition_task_with_partition(
         table: &Table,
         path: &str,
@@ -809,7 +944,7 @@ mod tests {
             identity_partition_task(&table, "/test/c.parquet", "c"),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 8);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 8, true);
 
         match planned.partitioning {
             Partitioning::Hash(exprs, partition_count) => {
@@ -824,13 +959,51 @@ mod tests {
         assert_eq!(planned.groups.len(), 3);
     }
 
-    // NOTE: The hash-equivalence tests below (planner buckets == DataFusion
-    // `RepartitionExec` buckets) intentionally cover only a representative subset
-    // of identity-partition dtypes: Utf8, Decimal128, and Timestamp. Exhaustive
-    // per-dtype coverage for the rest of `is_supported_identity_hash_dtype` — in
-    // particular the byte-reconstruction paths (Uuid / Fixed -> FixedSizeBinary,
-    // Binary / LargeBinary) plus Date32, Time64, Boolean, Float, and timezone'd
-    // Timestamp — is deferred to a follow-up PR.
+    #[test]
+    fn test_identity_partitioned_tasks_without_partition_spec_declare_hash_partitioning() {
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task_without_partition_spec(&table, "/test/a.parquet", "a"),
+            identity_partition_task_without_partition_spec(&table, "/test/b.parquet", "b"),
+            identity_partition_task_without_partition_spec(&table, "/test/c.parquet", "c"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 8, true);
+
+        match planned.partitioning {
+            Partitioning::Hash(exprs, partition_count) => {
+                assert_eq!(partition_count, 3);
+                assert_eq!(exprs.len(), 1);
+                let column = exprs[0].downcast_ref::<Column>().unwrap();
+                assert_eq!(column.name(), "category");
+                assert_eq!(column.index(), 1);
+            }
+            other => panic!("expected hash partitioning, got {other:?}"),
+        }
+        assert_eq!(planned.groups.len(), 3);
+    }
+
+    #[test]
+    fn test_identity_partitioning_disabled_uses_unknown_partitioning() {
+        // Identity criteria all hold, but the feature is off: fall back to
+        // UnknownPartitioning (mirrors `enable_identity_partitioning = false`).
+        let table = identity_partitioned_table();
+        let output_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
+        let tasks = vec![
+            identity_partition_task(&table, "/test/a.parquet", "a"),
+            identity_partition_task(&table, "/test/b.parquet", "b"),
+        ];
+
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, false);
+
+        assert_unknown_partitioning(planned, 2);
+    }
+
+    // The hash-equivalence tests (planner buckets == DataFusion `RepartitionExec`
+    // buckets) cover every dtype in `is_supported_identity_hash_dtype`. The only gap is
+    // float `-0.0`/NaN keys, which hash by raw bit pattern; the float tests use ordinary
+    // finite values only.
     #[test]
     fn test_identity_partitioned_hash_task_groups_match_datafusion_repartition() {
         let table = identity_partitioned_table();
@@ -845,8 +1018,13 @@ mod tests {
             .collect::<Vec<_>>();
         let partition_count = 3;
 
-        let planned =
-            plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), partition_count);
+        let planned = plan_task_groups_from_tasks(
+            &table,
+            &output_schema,
+            tasks.clone(),
+            partition_count,
+            true,
+        );
 
         let category_array = Arc::new(StringArray::from_iter_values(categories)) as ArrayRef;
         let mut hashes = vec![0; categories.len()];
@@ -894,8 +1072,13 @@ mod tests {
             .collect::<Vec<_>>();
         let partition_count = 4;
 
-        let planned =
-            plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), partition_count);
+        let planned = plan_task_groups_from_tasks(
+            &table,
+            &output_schema,
+            tasks.clone(),
+            partition_count,
+            true,
+        );
 
         let bucket_count = planned.partitioning.partition_count();
         match &planned.partitioning {
@@ -939,6 +1122,209 @@ mod tests {
     }
 
     #[test]
+    fn test_identity_hash_equivalence_boolean() {
+        let values = vec![true, false, true, false];
+        assert_identity_hash_equivalence(
+            "identity_bool",
+            Type::Primitive(PrimitiveType::Boolean),
+            DataType::Boolean,
+            values.iter().map(|v| Literal::bool(*v)).collect(),
+            Arc::new(BooleanArray::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_int() {
+        let values = vec![1_i32, 2, 3];
+        assert_identity_hash_equivalence(
+            "identity_int",
+            Type::Primitive(PrimitiveType::Int),
+            DataType::Int32,
+            values.iter().map(|v| Literal::int(*v)).collect(),
+            Arc::new(Int32Array::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_long() {
+        let values = vec![10_i64, 20, 30];
+        assert_identity_hash_equivalence(
+            "identity_long",
+            Type::Primitive(PrimitiveType::Long),
+            DataType::Int64,
+            values.iter().map(|v| Literal::long(*v)).collect(),
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_float() {
+        // Finite floats only; `-0.0`/NaN are the carve-out.
+        let values = vec![1.5_f32, 2.5, 3.5];
+        assert_identity_hash_equivalence(
+            "identity_float",
+            Type::Primitive(PrimitiveType::Float),
+            DataType::Float32,
+            values.iter().map(|v| Literal::float(*v)).collect(),
+            Arc::new(Float32Array::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_double() {
+        let values = vec![1.5_f64, 2.5, 3.5];
+        assert_identity_hash_equivalence(
+            "identity_double",
+            Type::Primitive(PrimitiveType::Double),
+            DataType::Float64,
+            values.iter().map(|v| Literal::double(*v)).collect(),
+            Arc::new(Float64Array::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_date() {
+        let values = vec![18_628_i32, 18_629, 18_630];
+        assert_identity_hash_equivalence(
+            "identity_date",
+            Type::Primitive(PrimitiveType::Date),
+            DataType::Date32,
+            values.iter().map(|v| Literal::date(*v)).collect(),
+            Arc::new(Date32Array::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_time() {
+        let values = vec![123_456_789_i64, 987_654_321, 1_000_000];
+        assert_identity_hash_equivalence(
+            "identity_time",
+            Type::Primitive(PrimitiveType::Time),
+            DataType::Time64(TimeUnit::Microsecond),
+            values.iter().map(|v| Literal::time(*v)).collect(),
+            Arc::new(Time64MicrosecondArray::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_timestamp_nanos() {
+        // `Literal::timestamp_nano` is pub(crate); use the public `PrimitiveLiteral::Long`.
+        let values = vec![
+            1_700_000_000_000_000_000_i64,
+            1_700_000_000_000_000_001,
+            1_700_000_000_000_000_002,
+        ];
+        assert_identity_hash_equivalence(
+            "identity_timestamp_ns",
+            Type::Primitive(PrimitiveType::TimestampNs),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            values
+                .iter()
+                .map(|v| Literal::Primitive(PrimitiveLiteral::Long(*v)))
+                .collect(),
+            Arc::new(TimestampNanosecondArray::from(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_timestamptz_micros() {
+        let values = vec![
+            1_740_600_000_000_000_i64,
+            1_740_600_100_000_000,
+            1_740_600_200_000_000,
+        ];
+        assert_identity_hash_equivalence(
+            "identity_timestamptz_us",
+            Type::Primitive(PrimitiveType::Timestamptz),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            values.iter().map(|v| Literal::timestamptz(*v)).collect(),
+            Arc::new(TimestampMicrosecondArray::from(values).with_timezone("+00:00")) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_binary() {
+        // Iceberg Binary maps to LargeBinary; force `Binary` to exercise that arm.
+        let values: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![4, 5], vec![6]];
+        assert_identity_hash_equivalence(
+            "identity_binary",
+            Type::Primitive(PrimitiveType::Binary),
+            DataType::Binary,
+            values.iter().map(|v| Literal::binary(v.clone())).collect(),
+            Arc::new(BinaryArray::from_iter_values(values.iter())) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_large_binary() {
+        let values: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![4, 5], vec![6]];
+        assert_identity_hash_equivalence(
+            "identity_large_binary",
+            Type::Primitive(PrimitiveType::Binary),
+            DataType::LargeBinary,
+            values.iter().map(|v| Literal::binary(v.clone())).collect(),
+            Arc::new(LargeBinaryArray::from_iter_values(values.iter())) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_uuid() {
+        let uuids = [1_u128, 2, 3]
+            .into_iter()
+            .map(Uuid::from_u128)
+            .collect::<Vec<_>>();
+        assert_identity_hash_equivalence(
+            "identity_uuid",
+            Type::Primitive(PrimitiveType::Uuid),
+            DataType::FixedSizeBinary(16),
+            uuids.iter().map(|u| Literal::uuid(*u)).collect(),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(uuids.iter().map(|u| u.into_bytes())).unwrap(),
+            ) as ArrayRef,
+            3,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_fixed() {
+        let values: Vec<Vec<u8>> = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
+        assert_identity_hash_equivalence(
+            "identity_fixed",
+            Type::Primitive(PrimitiveType::Fixed(4)),
+            DataType::FixedSizeBinary(4),
+            values.iter().map(|v| Literal::fixed(v.clone())).collect(),
+            Arc::new(FixedSizeBinaryArray::try_from_iter(values.iter().cloned()).unwrap())
+                as ArrayRef,
+            3,
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_equivalence_large_utf8() {
+        // Iceberg String maps to Utf8; force LargeUtf8 to exercise that arm.
+        let values = ["alpha", "beta", "gamma"];
+        assert_identity_hash_equivalence(
+            "identity_large_utf8",
+            Type::Primitive(PrimitiveType::String),
+            DataType::LargeUtf8,
+            values.iter().map(|s| Literal::string(*s)).collect(),
+            Arc::new(LargeStringArray::from_iter_values(values)) as ArrayRef,
+            4,
+        );
+    }
+
+    #[test]
     fn test_identity_partitioned_projection_without_identity_column_uses_unknown_partitioning() {
         let table = identity_partitioned_table();
         let table_arrow_schema = schema_to_arrow_schema(table.metadata().current_schema()).unwrap();
@@ -949,7 +1335,7 @@ mod tests {
             identity_partition_task(&table, "/test/b.parquet", "b"),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -963,7 +1349,7 @@ mod tests {
             identity_partition_task(&table, "/test/b.parquet", "b"),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -977,7 +1363,7 @@ mod tests {
             identity_partition_task(&table, "/test/b.parquet", "b"),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -991,7 +1377,7 @@ mod tests {
             identity_partition_task_with_partition(&table, "/test/no-partition.parquet", None),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -1009,7 +1395,7 @@ mod tests {
             ),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -1027,7 +1413,7 @@ mod tests {
             ),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -1045,7 +1431,7 @@ mod tests {
             ),
         ];
 
-        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4);
+        let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks, 4, true);
 
         assert_unknown_partitioning(planned, 2);
     }
@@ -1067,7 +1453,8 @@ mod tests {
             Field::new("category", DataType::Utf8View, true),
         ] {
             let output_schema = ArrowSchema::new(vec![category_field]);
-            let planned = plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), 4);
+            let planned =
+                plan_task_groups_from_tasks(&table, &output_schema, tasks.clone(), 4, true);
 
             assert_unknown_partitioning(planned, 2);
         }

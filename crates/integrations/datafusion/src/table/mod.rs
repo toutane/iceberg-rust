@@ -67,14 +67,32 @@ fn enable_eager_scan_planning(state: &dyn Session) -> bool {
         .is_some_and(|config| config.enable_eager_scan_planning)
 }
 
+fn enable_identity_partitioning(state: &dyn Session) -> bool {
+    state
+        .config()
+        .options()
+        .extensions
+        .get::<IcebergDataFusionConfig>()
+        .is_some_and(|config| config.enable_identity_partitioning)
+}
+
 async fn create_scan_plan(
     state: &dyn Session,
     table: Table,
     scan_config: IcebergScanConfig,
     limit: Option<usize>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    // `enable_identity_partitioning` only takes effect inside the eager branch.
     let file_task_groups = if enable_eager_scan_planning(state) {
-        Some(plan_file_task_groups(&table, &scan_config, state.config().target_partitions()).await?)
+        Some(
+            plan_file_task_groups(
+                &table,
+                &scan_config,
+                state.config().target_partitions(),
+                enable_identity_partitioning(state),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -617,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_eager_identity_hash_requires_task_partition_spec() {
+    async fn test_provider_eager_identity_hash_without_task_partition_spec() {
         use datafusion::datasource::TableProvider;
 
         let (catalog, namespace, table_name, _temp_dir) =
@@ -629,8 +647,12 @@ mod tests {
                 .unwrap(),
         );
 
-        let mut iceberg_config = IcebergDataFusionConfig::default();
-        iceberg_config.enable_eager_scan_planning = true;
+        // FileScanTask::partition_spec is currently None in this path, but identity
+        // hashing still uses the table's default spec metadata.
+        let iceberg_config = IcebergDataFusionConfig {
+            enable_eager_scan_planning: true,
+            enable_identity_partitioning: true,
+        };
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(4)
@@ -649,9 +671,12 @@ mod tests {
         let scan_plan = provider.scan(&state, None, &[], None).await.unwrap();
 
         match scan_plan.properties().output_partitioning() {
-            Partitioning::UnknownPartitioning(_) => {}
+            Partitioning::Hash(exprs, partition_count) => {
+                assert_eq!(exprs.len(), 1);
+                assert_eq!(*partition_count, 2);
+            }
             other => {
-                panic!("expected unknown partitioning without task partition spec, got {other:?}")
+                panic!("expected hash partitioning without task partition spec, got {other:?}")
             }
         }
     }

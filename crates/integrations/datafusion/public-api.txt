@@ -115,6 +115,7 @@ pub fn iceberg_datafusion::IcebergCatalogProvider::schema(&self, name: &str) -> 
 pub fn iceberg_datafusion::IcebergCatalogProvider::schema_names(&self) -> alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct iceberg_datafusion::IcebergDataFusionConfig
 pub iceberg_datafusion::IcebergDataFusionConfig::enable_eager_scan_planning: bool
+pub iceberg_datafusion::IcebergDataFusionConfig::enable_identity_partitioning: bool
 impl core::clone::Clone for iceberg_datafusion::IcebergDataFusionConfig
 pub fn iceberg_datafusion::IcebergDataFusionConfig::clone(&self) -> iceberg_datafusion::IcebergDataFusionConfig
 impl core::default::Default for iceberg_datafusion::IcebergDataFusionConfig
