@@ -54,7 +54,7 @@ pub struct IcebergTableScan {
 }
 
 impl IcebergTableScan {
-    pub(crate) fn new(
+    pub fn new(
         table: Table,
         scan_config: IcebergScanConfig,
         limit: Option<usize>,
@@ -97,6 +97,14 @@ impl IcebergTableScan {
 
     pub fn limit(&self) -> Option<usize> {
         self.limit
+    }
+
+    pub fn scan_config(&self) -> &IcebergScanConfig {
+        &self.scan_config
+    }
+
+    pub fn file_task_groups(&self) -> Option<&[Arc<[FileScanTask]>]> {
+        self.file_task_groups.as_deref()
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
