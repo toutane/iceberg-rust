@@ -267,6 +267,41 @@ async fn test_set_enable_eager_scan_planning() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_scan_node_round_trip_via_accessors() -> Result<()> {
+    let data_file_count = 3;
+    let (iceberg_catalog, namespace, table_name) =
+        get_multi_file_table_context("test_scan_round_trip", "my_table", data_file_count).await?;
+    let ctx = get_read_context(iceberg_catalog, data_file_count, Some(true)).await?;
+
+    let provider = ctx.catalog("catalog").unwrap();
+    let schema = provider.schema(&namespace[0]).unwrap();
+    let table = schema.table(&table_name).await.unwrap().unwrap();
+    let plan = table.scan(&ctx.state(), None, &[], Some(7)).await.unwrap();
+    let scan = plan
+        .downcast_ref::<IcebergTableScan>()
+        .expect("Expected IcebergTableScan");
+
+    // Rebuild an equivalent node from the public constructor and accessors.
+    let rebuilt = IcebergTableScan::new(
+        scan.table().clone(),
+        scan.scan_config().clone(),
+        scan.limit(),
+        scan.file_task_groups()
+            .map(|groups| groups.iter().map(|group| group.to_vec()).collect()),
+    );
+
+    assert_eq!(rebuilt.snapshot_id(), scan.snapshot_id());
+    assert_eq!(rebuilt.projection(), scan.projection());
+    assert_eq!(rebuilt.limit(), scan.limit());
+    assert_eq!(
+        rebuilt.file_task_groups().map(<[_]>::len),
+        scan.file_task_groups().map(<[_]>::len),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_multi_partition_scan_matches_single_partition_results() -> Result<()> {
     let data_file_count = 3;
     let target_partitions = data_file_count + 1;
