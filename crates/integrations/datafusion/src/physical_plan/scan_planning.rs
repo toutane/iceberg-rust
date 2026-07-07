@@ -30,7 +30,7 @@ use super::expr_to_predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
 #[derive(Debug, Clone)]
-pub(crate) struct IcebergScanConfig {
+pub struct IcebergScanConfig {
     /// Snapshot of the table to scan.
     snapshot_id: Option<i64>,
     /// Output schema after projection.
@@ -42,7 +42,7 @@ pub(crate) struct IcebergScanConfig {
 }
 
 impl IcebergScanConfig {
-    pub(crate) fn new(
+    pub fn new(
         schema: ArrowSchemaRef,
         snapshot_id: Option<i64>,
         projection: Option<&Vec<usize>>,
@@ -61,19 +61,19 @@ impl IcebergScanConfig {
         }
     }
 
-    pub(crate) fn snapshot_id(&self) -> Option<i64> {
+    pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
     }
 
-    pub(crate) fn output_schema(&self) -> ArrowSchemaRef {
+    pub fn output_schema(&self) -> ArrowSchemaRef {
         self.output_schema.clone()
     }
 
-    pub(crate) fn column_names(&self) -> Option<&[String]> {
+    pub fn column_names(&self) -> Option<&[String]> {
         self.column_names.as_deref()
     }
 
-    pub(crate) fn predicates(&self) -> Option<&Predicate> {
+    pub fn predicates(&self) -> Option<&Predicate> {
         self.predicates.as_ref()
     }
 }

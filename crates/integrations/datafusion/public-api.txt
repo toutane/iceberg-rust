@@ -12,11 +12,25 @@ pub fn iceberg_datafusion::metadata_table::IcebergMetadataTableProvider::scan<'l
 pub fn iceberg_datafusion::metadata_table::IcebergMetadataTableProvider::schema(&self) -> arrow_schema::schema::SchemaRef
 pub fn iceberg_datafusion::metadata_table::IcebergMetadataTableProvider::table_type(&self) -> datafusion_expr::table_source::TableType
 pub mod iceberg_datafusion::physical_plan
+pub struct iceberg_datafusion::physical_plan::IcebergScanConfig
+impl iceberg_datafusion::physical_plan::IcebergScanConfig
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::column_names(&self) -> core::option::Option<&[alloc::string::String]>
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::new(schema: arrow_schema::schema::SchemaRef, snapshot_id: core::option::Option<i64>, projection: core::option::Option<&alloc::vec::Vec<usize>>, filters: &[datafusion_expr::expr::Expr]) -> Self
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::output_schema(&self) -> arrow_schema::schema::SchemaRef
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::predicates(&self) -> core::option::Option<&iceberg::expr::predicate::Predicate>
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::snapshot_id(&self) -> core::option::Option<i64>
+impl core::clone::Clone for iceberg_datafusion::physical_plan::IcebergScanConfig
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::clone(&self) -> iceberg_datafusion::physical_plan::IcebergScanConfig
+impl core::fmt::Debug for iceberg_datafusion::physical_plan::IcebergScanConfig
+pub fn iceberg_datafusion::physical_plan::IcebergScanConfig::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg_datafusion::physical_plan::IcebergTableScan
 impl iceberg_datafusion::physical_plan::IcebergTableScan
+pub fn iceberg_datafusion::physical_plan::IcebergTableScan::file_task_groups(&self) -> core::option::Option<&[alloc::sync::Arc<[iceberg::scan::task::FileScanTask]>]>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::limit(&self) -> core::option::Option<usize>
+pub fn iceberg_datafusion::physical_plan::IcebergTableScan::new(table: iceberg::table::Table, scan_config: iceberg_datafusion::physical_plan::IcebergScanConfig, limit: core::option::Option<usize>, file_task_groups: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<iceberg::scan::task::FileScanTask>>>) -> Self
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::predicates(&self) -> core::option::Option<&iceberg::expr::predicate::Predicate>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::projection(&self) -> core::option::Option<&[alloc::string::String]>
+pub fn iceberg_datafusion::physical_plan::IcebergTableScan::scan_config(&self) -> &iceberg_datafusion::physical_plan::IcebergScanConfig
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::snapshot_id(&self) -> core::option::Option<i64>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::table(&self) -> &iceberg::table::Table
 impl core::fmt::Debug for iceberg_datafusion::physical_plan::IcebergTableScan
