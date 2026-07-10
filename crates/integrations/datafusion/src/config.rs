@@ -23,6 +23,10 @@ extensions_options! {
     pub struct IcebergDataFusionConfig {
         /// Plan Iceberg file scan tasks during TableProvider::scan().
         pub enable_eager_scan_planning: bool, default = false
+
+        /// Declare `Partitioning::Hash` for identity partition specs during eager scan
+        /// planning. Only consulted when `enable_eager_scan_planning` is true.
+        pub enable_identity_partitioning: bool, default = false
     }
 }
 

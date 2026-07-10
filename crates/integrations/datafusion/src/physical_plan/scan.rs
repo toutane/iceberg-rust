@@ -32,7 +32,7 @@ use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::table::Table;
 
-use super::scan_planning::{IcebergScanConfig, build_table_scan};
+use super::scan_planning::{IcebergScanConfig, PlannedFileTaskGroups, build_table_scan};
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
@@ -57,25 +57,45 @@ impl IcebergTableScan {
         table: Table,
         scan_config: IcebergScanConfig,
         limit: Option<usize>,
-        file_task_groups: Option<Vec<Vec<FileScanTask>>>,
-    ) -> Self {
-        let partition_count = file_task_groups.as_ref().map_or(1, |groups| groups.len());
+        file_task_groups: Option<PlannedFileTaskGroups>,
+    ) -> DFResult<Self> {
+        if let Some(planned) = &file_task_groups
+            && planned.groups.len() != planned.partitioning.partition_count()
+        {
+            // Currently impossible by construction: both planning paths build the
+            // group vector and the partitioning with matching counts. Surface a
+            // recoverable error rather than silently dropping the surplus groups
+            // (DataFusion would only execute `partition_count` output partitions)
+            // should a future refactor decouple the two.
+            return Err(datafusion::common::DataFusionError::Internal(format!(
+                "planned file task group count ({}) must match output partition count ({})",
+                planned.groups.len(),
+                planned.partitioning.partition_count(),
+            )));
+        }
+
+        let output_partitioning = file_task_groups
+            .as_ref()
+            .map_or(Partitioning::UnknownPartitioning(1), |planned| {
+                planned.partitioning.clone()
+            });
         let plan_properties =
-            IcebergTableScan::compute_properties(scan_config.output_schema(), partition_count);
-        let file_task_groups = file_task_groups.map(|groups| {
-            groups
+            IcebergTableScan::compute_properties(scan_config.output_schema(), output_partitioning);
+        let file_task_groups = file_task_groups.map(|planned| {
+            planned
+                .groups
                 .into_iter()
                 .map(Arc::<[FileScanTask]>::from)
                 .collect()
         });
 
-        Self {
+        Ok(Self {
             table,
             scan_config,
             plan_properties,
             limit,
             file_task_groups,
-        }
+        })
     }
 
     pub fn table(&self) -> &Table {
@@ -107,10 +127,13 @@ impl IcebergTableScan {
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef, partition_count: usize) -> Arc<PlanProperties> {
+    fn compute_properties(
+        schema: ArrowSchemaRef,
+        output_partitioning: Partitioning,
+    ) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(partition_count),
+            output_partitioning,
             EmissionType::Incremental,
             Boundedness::Bounded,
         ))

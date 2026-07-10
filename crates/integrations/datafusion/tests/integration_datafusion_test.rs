@@ -27,6 +27,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::SessionConfig;
 use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
@@ -38,7 +39,7 @@ use iceberg::test_utils::check_record_batches;
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation, TableIdent,
 };
-use iceberg_datafusion::physical_plan::IcebergTableScan;
+use iceberg_datafusion::physical_plan::{IcebergTableScan, PlannedFileTaskGroups};
 use iceberg_datafusion::{IcebergCatalogProvider, IcebergDataFusionConfig};
 use tempfile::TempDir;
 
@@ -282,13 +283,24 @@ async fn test_scan_node_round_trip_via_accessors() -> Result<()> {
         .expect("Expected IcebergTableScan");
 
     // Rebuild an equivalent node from the public constructor and accessors.
+    let file_task_groups = scan.file_task_groups().map(|groups| {
+        let groups = groups
+            .iter()
+            .map(|group| group.to_vec())
+            .collect::<Vec<_>>();
+        let partition_count = groups.len();
+        PlannedFileTaskGroups {
+            groups,
+            partitioning: Partitioning::UnknownPartitioning(partition_count),
+        }
+    });
     let rebuilt = IcebergTableScan::new(
         scan.table().clone(),
         scan.scan_config().clone(),
         scan.limit(),
-        scan.file_task_groups()
-            .map(|groups| groups.iter().map(|group| group.to_vec()).collect()),
-    );
+        file_task_groups,
+    )
+    .unwrap();
 
     assert_eq!(rebuilt.snapshot_id(), scan.snapshot_id());
     assert_eq!(rebuilt.projection(), scan.projection());

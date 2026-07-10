@@ -67,14 +67,32 @@ fn enable_eager_scan_planning(state: &dyn Session) -> bool {
         .is_some_and(|config| config.enable_eager_scan_planning)
 }
 
+fn enable_identity_partitioning(state: &dyn Session) -> bool {
+    state
+        .config()
+        .options()
+        .extensions
+        .get::<IcebergDataFusionConfig>()
+        .is_some_and(|config| config.enable_identity_partitioning)
+}
+
 async fn create_scan_plan(
     state: &dyn Session,
     table: Table,
     scan_config: IcebergScanConfig,
     limit: Option<usize>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    // `enable_identity_partitioning` only takes effect inside the eager branch.
     let file_task_groups = if enable_eager_scan_planning(state) {
-        Some(plan_file_task_groups(&table, &scan_config, state.config().target_partitions()).await?)
+        Some(
+            plan_file_task_groups(
+                &table,
+                &scan_config,
+                state.config().target_partitions(),
+                enable_identity_partitioning(state),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -84,7 +102,7 @@ async fn create_scan_plan(
         scan_config,
         limit,
         file_task_groups,
-    )))
+    )?))
 }
 
 /// Catalog-backed table provider with automatic metadata refresh.
@@ -378,8 +396,8 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::common::Column;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::SessionContext;
+    use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use iceberg::io::FileIO;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -614,6 +632,53 @@ mod tests {
 
         // The execution should succeed
         assert!(execution_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_provider_eager_identity_hash_without_task_partition_spec() {
+        use datafusion::datasource::TableProvider;
+
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_partitioned_test_catalog_and_table(Some(true)).await;
+
+        let provider = Arc::new(
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .unwrap(),
+        );
+
+        // FileScanTask::partition_spec is currently None in this path, but identity
+        // hashing still uses the table's default spec metadata.
+        let iceberg_config = IcebergDataFusionConfig {
+            enable_eager_scan_planning: true,
+            enable_identity_partitioning: true,
+        };
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_option_extension(iceberg_config),
+        );
+        ctx.register_table("test_table", provider.clone()).unwrap();
+
+        ctx.sql("INSERT INTO test_table VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let state = ctx.state();
+        let scan_plan = provider.scan(&state, None, &[], None).await.unwrap();
+
+        match scan_plan.properties().output_partitioning() {
+            Partitioning::Hash(exprs, partition_count) => {
+                assert_eq!(exprs.len(), 1);
+                assert_eq!(*partition_count, 2);
+            }
+            other => {
+                panic!("expected hash partitioning without task partition spec, got {other:?}")
+            }
+        }
     }
 
     #[tokio::test]
