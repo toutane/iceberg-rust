@@ -94,7 +94,7 @@ pub(crate) async fn plan_file_task_groups(
         .await
         .map_err(to_datafusion_error)?;
 
-    Ok(group_file_scan_tasks_round_robin(tasks, target_partitions))
+    Ok(group_file_scan_tasks_by_size(tasks, target_partitions))
 }
 
 fn get_column_names(
@@ -108,11 +108,17 @@ fn get_column_names(
     })
 }
 
-/// Groups file scan tasks into `target_partitions` groups using a naive
-/// round-robin assignment. Non-empty groups are bounded by `tasks.len()`.
-// TODO: Replace this naive round-robin grouping with size-based grouping once the
-// first parallel scan path is stable. Keep this v1 simple and deterministic.
-fn group_file_scan_tasks_round_robin(
+/// Groups file scan tasks into `target_partitions` groups, greedily balancing
+/// total file byte size across groups (longest-processing-time heuristic): tasks
+/// are visited largest-first and each is appended to the currently lightest
+/// group. Ties are broken by original index so the output is deterministic
+/// regardless of input ordering. `target_partitions` is clamped to a minimum of
+/// 1; empty groups are dropped.
+///
+/// Each task contributes [`task_weight`] (`max(file_size_in_bytes, 1)`): the
+/// 1-byte floor keeps the distribution round-robin-like when sizes are equal or
+/// unavailable (all-zero), instead of collapsing every task into the first group.
+fn group_file_scan_tasks_by_size(
     tasks: Vec<FileScanTask>,
     target_partitions: usize,
 ) -> Vec<Vec<FileScanTask>> {
@@ -122,12 +128,28 @@ fn group_file_scan_tasks_round_robin(
 
     let target_partitions = target_partitions.max(1).min(tasks.len());
 
+    let mut indexed: Vec<(usize, FileScanTask)> = tasks.into_iter().enumerate().collect();
+    indexed.sort_by(|(ia, a), (ib, b)| task_weight(b).cmp(&task_weight(a)).then(ia.cmp(ib)));
+
     let mut groups: Vec<Vec<FileScanTask>> = vec![Vec::new(); target_partitions];
-    for (i, task) in tasks.into_iter().enumerate() {
-        groups[i % target_partitions].push(task);
+    let mut group_weight = vec![0u64; target_partitions];
+    for (_, task) in indexed {
+        // Pick the lightest group; `min_by_key` returns the first minimum on
+        // ties, i.e. the lowest group index.
+        let target = (0..target_partitions)
+            .min_by_key(|&i| group_weight[i])
+            .expect("target_partitions is at least 1");
+        group_weight[target] += task_weight(&task);
+        groups[target].push(task);
     }
 
     groups
+}
+
+/// Byte weight of a task, floored at 1 so equal or zero sizes still spread out
+/// across groups instead of piling into the first one.
+fn task_weight(task: &FileScanTask) -> u64 {
+    task.file_size_in_bytes.max(1)
 }
 
 pub(crate) fn build_table_scan(
@@ -146,4 +168,108 @@ pub(crate) fn build_table_scan(
         builder = builder.with_filter(pred);
     }
     builder.build().map_err(to_datafusion_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+
+    use super::*;
+
+    /// Minimal `FileScanTask` carrying an explicit `file_size_in_bytes`.
+    fn sized_task(path: &str, size: u64) -> FileScanTask {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "v", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        FileScanTask::builder()
+            .with_file_size_in_bytes(size)
+            .with_start(0)
+            .with_length(size)
+            .with_record_count(Some(1))
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(schema))
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(true)
+            .build()
+    }
+
+    fn task_paths(tasks: &[FileScanTask]) -> Vec<&str> {
+        tasks.iter().map(|task| task.data_file_path()).collect()
+    }
+
+    fn group_bytes(groups: &[Vec<FileScanTask>]) -> Vec<u64> {
+        groups
+            .iter()
+            .map(|group| group.iter().map(|task| task.file_size_in_bytes).sum())
+            .collect()
+    }
+
+    #[test]
+    fn test_size_based_grouping_balances_by_bytes() {
+        let tasks = vec![
+            sized_task("/a.parquet", 100),
+            sized_task("/b.parquet", 90),
+            sized_task("/c.parquet", 20),
+            sized_task("/d.parquet", 10),
+        ];
+
+        let groups = group_file_scan_tasks_by_size(tasks, 2);
+
+        // LPT over the descending sort [100, 90, 20, 10]:
+        //   100 -> g0, 90 -> g1, 20 -> g1 (90 < 100), 10 -> g0 (100 < 110).
+        assert_eq!(groups.len(), 2);
+        assert_eq!(task_paths(&groups[0]), vec!["/a.parquet", "/d.parquet"]);
+        assert_eq!(task_paths(&groups[1]), vec!["/b.parquet", "/c.parquet"]);
+        assert_eq!(group_bytes(&groups), vec![110, 110]);
+    }
+
+    #[test]
+    fn test_size_based_grouping_equal_sizes_spreads_like_round_robin() {
+        let tasks = (0..4)
+            .map(|i| sized_task(&format!("/{i}.parquet"), 50))
+            .collect::<Vec<_>>();
+
+        let groups = group_file_scan_tasks_by_size(tasks, 2);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 2);
+    }
+
+    #[test]
+    fn test_size_based_grouping_zero_sizes_does_not_collapse() {
+        let tasks = (0..6)
+            .map(|i| sized_task(&format!("/{i}.parquet"), 0))
+            .collect::<Vec<_>>();
+
+        let groups = group_file_scan_tasks_by_size(tasks, 3);
+
+        // The 1-byte weight floor keeps the tasks spread across all groups
+        // instead of piling into the first one.
+        assert_eq!(groups.len(), 3);
+        for group in &groups {
+            assert_eq!(group.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_size_based_grouping_fewer_tasks_than_partitions() {
+        let tasks = vec![sized_task("/a.parquet", 10), sized_task("/b.parquet", 20)];
+
+        let groups = group_file_scan_tasks_by_size(tasks, 4);
+
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn test_size_based_grouping_empty_tasks() {
+        let groups = group_file_scan_tasks_by_size(vec![], 4);
+
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].is_empty());
+    }
 }
