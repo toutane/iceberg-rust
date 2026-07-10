@@ -27,7 +27,7 @@ pub struct iceberg_datafusion::physical_plan::IcebergTableScan
 impl iceberg_datafusion::physical_plan::IcebergTableScan
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::file_task_groups(&self) -> core::option::Option<&[alloc::sync::Arc<[iceberg::scan::task::FileScanTask]>]>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::limit(&self) -> core::option::Option<usize>
-pub fn iceberg_datafusion::physical_plan::IcebergTableScan::new(table: iceberg::table::Table, scan_config: iceberg_datafusion::physical_plan::IcebergScanConfig, limit: core::option::Option<usize>, file_task_groups: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<iceberg::scan::task::FileScanTask>>>) -> Self
+pub fn iceberg_datafusion::physical_plan::IcebergTableScan::new(table: iceberg::table::Table, scan_config: iceberg_datafusion::physical_plan::IcebergScanConfig, limit: core::option::Option<usize>, file_task_groups: core::option::Option<iceberg_datafusion::physical_plan::PlannedFileTaskGroups>) -> datafusion_common::error::Result<Self>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::predicates(&self) -> core::option::Option<&iceberg::expr::predicate::Predicate>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::projection(&self) -> core::option::Option<&[alloc::string::String]>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::scan_config(&self) -> &iceberg_datafusion::physical_plan::IcebergScanConfig
@@ -43,6 +43,11 @@ pub fn iceberg_datafusion::physical_plan::IcebergTableScan::execute(&self, parti
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::name(&self) -> &str
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::properties(&self) -> &alloc::sync::Arc<datafusion_physical_plan::execution_plan::PlanProperties>
 pub fn iceberg_datafusion::physical_plan::IcebergTableScan::with_new_children(self: alloc::sync::Arc<Self>, _children: alloc::vec::Vec<alloc::sync::Arc<dyn datafusion_physical_plan::execution_plan::ExecutionPlan>>) -> datafusion_common::error::Result<alloc::sync::Arc<dyn datafusion_physical_plan::execution_plan::ExecutionPlan>>
+pub struct iceberg_datafusion::physical_plan::PlannedFileTaskGroups
+pub iceberg_datafusion::physical_plan::PlannedFileTaskGroups::groups: alloc::vec::Vec<alloc::vec::Vec<iceberg::scan::task::FileScanTask>>
+pub iceberg_datafusion::physical_plan::PlannedFileTaskGroups::partitioning: datafusion_physical_expr::partitioning::Partitioning
+impl core::fmt::Debug for iceberg_datafusion::physical_plan::PlannedFileTaskGroups
+pub fn iceberg_datafusion::physical_plan::PlannedFileTaskGroups::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub fn iceberg_datafusion::physical_plan::convert_filters_to_predicate(filters: &[datafusion_expr::expr::Expr]) -> core::option::Option<iceberg::expr::predicate::Predicate>
 pub fn iceberg_datafusion::physical_plan::project_with_partition(input: alloc::sync::Arc<dyn datafusion_physical_plan::execution_plan::ExecutionPlan>, table: &iceberg::table::Table) -> datafusion_common::error::Result<alloc::sync::Arc<dyn datafusion_physical_plan::execution_plan::ExecutionPlan>>
 pub mod iceberg_datafusion::table
