@@ -200,8 +200,7 @@ async fn scan_partition_count(
 
     let state = ctx.state();
     let plan = table.scan(&state, None, &[], None).await.unwrap();
-    plan.as_any()
-        .downcast_ref::<IcebergTableScan>()
+    plan.downcast_ref::<IcebergTableScan>()
         .expect("Expected IcebergTableScan");
     plan.properties().output_partitioning().partition_count()
 }
