@@ -1778,16 +1778,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctor"
-version = "1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb22e947478ccf9dc44d8922042c677a63fbb88f2cb468521d1145816e5087cb"
-dependencies = [
- "link-section",
- "linktime-proc-macro",
-]
-
-[[package]]
 name = "ctor-proc-macro"
 version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4556,12 +4546,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "link-section"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e333fe507b738576d6da5bb3f1a7d7a1c80307ed9ef31624c057d844c19c93e9"
-
-[[package]]
 name = "linked-hash-map"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4577,12 +4561,6 @@ dependencies = [
  "faststr",
  "tokio",
 ]
-
-[[package]]
-name = "linktime-proc-macro"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c7b0a3383c2a1002d11349c92c85a666a5fb679e96c79d782cf0dbe557fd6ee"
 
 [[package]]
 name = "linux-raw-sys"
@@ -5136,10 +5114,7 @@ version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c9c85ce253ff87225e7669979d877a20c98a06604ec9d6dd5f4473e08f1ae1"
 dependencies = [
- "ctor 1.0.8",
  "opendal-core",
- "opendal-layer-concurrent-limit",
- "opendal-layer-logging",
  "opendal-layer-retry",
  "opendal-layer-timeout",
  "opendal-service-azdls",
@@ -5176,28 +5151,6 @@ dependencies = [
  "url",
  "uuid",
  "web-time",
-]
-
-[[package]]
-name = "opendal-layer-concurrent-limit"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d6f81ba6960e3fae1882f253b114b21d7e444e1534f209c7737a79f6243eb6f"
-dependencies = [
- "futures",
- "http 1.4.2",
- "mea",
- "opendal-core",
-]
-
-[[package]]
-name = "opendal-layer-logging"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ada45c6d81d1aa4c9305d0c7d4bc317c59c85866a0908a2d75a7a978aa5ee2"
-dependencies = [
- "log",
- "opendal-core",
 ]
 
 [[package]]
@@ -8979,7 +8932,7 @@ dependencies = [
  "chrono",
  "colored",
  "const-str",
- "ctor 0.6.3",
+ "ctor",
  "dirs",
  "futures",
  "git-version",
