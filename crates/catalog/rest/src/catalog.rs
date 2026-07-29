@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
-use iceberg::table::Table;
+use iceberg::table::{Table, TableBuilder};
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
     TableCommit, TableCreation, TableIdent,
@@ -57,12 +57,44 @@ const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
 
+#[derive(Clone, Debug, Default)]
+struct RestCatalogRuntime {
+    table_runtime: Option<Runtime>,
+    file_io_runtime: Option<tokio::runtime::Handle>,
+}
+
+impl RestCatalogRuntime {
+    fn with_table_runtime(runtime: Runtime) -> Self {
+        Self {
+            table_runtime: Some(runtime),
+            file_io_runtime: None,
+        }
+    }
+
+    fn with_file_io_runtime(io_handle: tokio::runtime::Handle) -> Self {
+        Self {
+            table_runtime: None,
+            file_io_runtime: Some(io_handle),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.table_runtime.is_none() && self.file_io_runtime.is_none()
+    }
+}
+
+impl From<Runtime> for RestCatalogRuntime {
+    fn from(runtime: Runtime) -> Self {
+        Self::with_table_runtime(runtime)
+    }
+}
+
 /// Builder for [`RestCatalog`].
 #[derive(Debug)]
 pub struct RestCatalogBuilder {
     config: RestCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
-    runtime: Option<Runtime>,
+    runtime: RestCatalogRuntime,
 }
 
 impl Default for RestCatalogBuilder {
@@ -76,8 +108,20 @@ impl Default for RestCatalogBuilder {
                 client: None,
             },
             storage_factory: None,
-            runtime: None,
+            runtime: RestCatalogRuntime::default(),
         }
+    }
+}
+
+impl RestCatalogBuilder {
+    /// Route storage operations through `io_handle` without assigning a full
+    /// runtime to tables loaded by this catalog.
+    ///
+    /// This is mutually exclusive with [`CatalogBuilder::with_runtime`]. If both
+    /// are called, the last call wins.
+    pub fn with_file_io_runtime(mut self, io_handle: tokio::runtime::Handle) -> Self {
+        self.runtime = RestCatalogRuntime::with_file_io_runtime(io_handle);
+        self
     }
 }
 
@@ -90,7 +134,7 @@ impl CatalogBuilder for RestCatalogBuilder {
     }
 
     fn with_runtime(mut self, runtime: Runtime) -> Self {
-        self.runtime = Some(runtime);
+        self.runtime = RestCatalogRuntime::with_table_runtime(runtime);
         self
     }
 
@@ -130,7 +174,11 @@ impl CatalogBuilder for RestCatalogBuilder {
                     "Catalog uri is required",
                 ))
             } else {
-                let runtime = self.runtime.unwrap_or_else(Runtime::current);
+                let runtime = if self.runtime.is_empty() {
+                    RestCatalogRuntime::with_table_runtime(Runtime::current())
+                } else {
+                    self.runtime
+                };
                 Ok(RestCatalog::new(self.config, self.storage_factory, runtime))
             }
         };
@@ -359,7 +407,7 @@ pub struct RestCatalog {
     ctx: OnceCell<RestContext>,
     /// Storage factory for creating FileIO instances.
     storage_factory: Option<Arc<dyn StorageFactory>>,
-    runtime: Runtime,
+    runtime: RestCatalogRuntime,
 }
 
 impl RestCatalog {
@@ -367,13 +415,20 @@ impl RestCatalog {
     fn new(
         config: RestCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
-        runtime: Runtime,
+        runtime: impl Into<RestCatalogRuntime>,
     ) -> Self {
         Self {
             user_config: config,
             ctx: OnceCell::new(),
             storage_factory,
-            runtime,
+            runtime: runtime.into(),
+        }
+    }
+
+    fn with_table_runtime(&self, builder: TableBuilder) -> TableBuilder {
+        match &self.runtime.table_runtime {
+            Some(runtime) => builder.runtime(runtime.clone()),
+            None => builder,
         }
     }
 
@@ -483,7 +538,13 @@ impl RestCatalog {
                 )
             })?;
 
-        let file_io = FileIOBuilder::new(factory).with_props(props).build();
+        let mut builder = FileIOBuilder::new(factory).with_props(props);
+        if let Some(runtime) = &self.runtime.table_runtime {
+            builder = builder.with_runtime(runtime.clone());
+        } else if let Some(io_handle) = &self.runtime.file_io_runtime {
+            builder = builder.with_io_runtime(io_handle.clone());
+        }
+        let file_io = builder.build();
 
         Ok(file_io)
     }
@@ -804,8 +865,8 @@ impl Catalog for RestCatalog {
         let table_builder = Table::builder()
             .identifier(table_ident.clone())
             .file_io(file_io)
-            .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .metadata(response.metadata);
+        let table_builder = self.with_table_runtime(table_builder);
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -861,8 +922,8 @@ impl Catalog for RestCatalog {
         let table_builder = Table::builder()
             .identifier(table_ident.clone())
             .file_io(file_io)
-            .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .metadata(response.metadata);
+        let table_builder = self.with_table_runtime(table_builder);
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -993,13 +1054,12 @@ impl Catalog for RestCatalog {
 
         let file_io = self.load_file_io(Some(metadata_location), None).await?;
 
-        Table::builder()
+        let table_builder = Table::builder()
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .metadata_location(metadata_location.clone())
-            .runtime(self.runtime.clone())
-            .build()
+            .metadata_location(metadata_location.clone());
+        self.with_table_runtime(table_builder).build()
     }
 
     async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
@@ -1066,13 +1126,12 @@ impl Catalog for RestCatalog {
             .load_file_io(Some(&response.metadata_location), None)
             .await?;
 
-        Table::builder()
+        let table_builder = Table::builder()
             .identifier(commit.identifier().clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .metadata_location(response.metadata_location)
-            .runtime(self.runtime.clone())
-            .build()
+            .metadata_location(response.metadata_location);
+        self.with_table_runtime(table_builder).build()
     }
 }
 
@@ -1082,8 +1141,13 @@ mod tests {
     use std::io::BufReader;
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use chrono::{TimeZone, Utc};
-    use iceberg::io::LocalFsStorageFactory;
+    use futures::stream::BoxStream;
+    use iceberg::io::{
+        FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory, OutputFile, Storage,
+        StorageConfig, StorageFactory,
+    };
     use iceberg::spec::{
         FormatVersion, NestedField, NullOrder, Operation, PrimitiveType, Schema, Snapshot,
         SnapshotLog, SortDirection, SortField, SortOrder, Summary, Transform, Type,
@@ -2346,6 +2410,67 @@ mod tests {
         rename_table_mock.assert_async().await;
     }
 
+    #[test]
+    fn test_load_table_with_file_io_runtime_routes_storage_to_io() {
+        const REST_IO_THREAD_NAME: &str = "iceberg-rest-file-io-runtime-test";
+
+        let test_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name(REST_IO_THREAD_NAME)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_rt.block_on(async {
+            let mut server = Server::new_async().await;
+            let config_mock = create_config_mock(&mut server).await;
+            let load_table_mock = server
+                .mock("GET", "/v1/namespaces/ns1/tables/test1")
+                .with_status(200)
+                .with_body_from_file(format!(
+                    "{}/testdata/{}",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "load_table_response.json"
+                ))
+                .create_async()
+                .await;
+
+            let props = HashMap::from([(REST_CATALOG_PROP_URI.to_string(), server.url())]);
+            let catalog = RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(ThreadNameStorageFactory {
+                    io_thread_name: REST_IO_THREAD_NAME.to_string(),
+                }))
+                .with_file_io_runtime(io_rt.handle().clone())
+                .load("rest", props)
+                .await
+                .unwrap();
+
+            let table = catalog
+                .load_table(&TableIdent::new(
+                    NamespaceIdent::new("ns1".to_string()),
+                    "test1".to_string(),
+                ))
+                .await
+                .unwrap();
+
+            assert!(
+                table
+                    .file_io()
+                    .exists("s3://warehouse/database/table/data")
+                    .await
+                    .unwrap()
+            );
+
+            config_mock.assert_async().await;
+            load_table_mock.assert_async().await;
+        });
+    }
+
     #[tokio::test]
     async fn test_load_table_404() {
         let mut server = Server::new_async().await;
@@ -2956,6 +3081,73 @@ mod tests {
         if let Err(err) = catalog {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog uri is required");
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct ThreadNameStorageFactory {
+        io_thread_name: String,
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for ThreadNameStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+            Ok(Arc::new(ThreadNameStorage {
+                io_thread_name: self.io_thread_name.clone(),
+            }))
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct ThreadNameStorage {
+        io_thread_name: String,
+    }
+
+    #[typetag::serde]
+    #[async_trait]
+    impl Storage for ThreadNameStorage {
+        async fn exists(&self, _path: &str) -> Result<bool> {
+            Ok(std::thread::current().name() == Some(self.io_thread_name.as_str()))
+        }
+
+        async fn metadata(&self, _path: &str) -> Result<FileMetadata> {
+            unimplemented!("not used")
+        }
+
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            unimplemented!("not used")
+        }
+
+        async fn reader(&self, _path: &str) -> Result<Box<dyn FileRead>> {
+            unimplemented!("not used")
+        }
+
+        async fn write(&self, _path: &str, _bs: Bytes) -> Result<()> {
+            unimplemented!("not used")
+        }
+
+        async fn writer(&self, _path: &str) -> Result<Box<dyn FileWrite>> {
+            unimplemented!("not used")
+        }
+
+        async fn delete(&self, _path: &str) -> Result<()> {
+            unimplemented!("not used")
+        }
+
+        async fn delete_prefix(&self, _path: &str) -> Result<()> {
+            unimplemented!("not used")
+        }
+
+        async fn delete_stream(&self, _paths: BoxStream<'static, String>) -> Result<()> {
+            unimplemented!("not used")
+        }
+
+        fn new_input(&self, _path: &str) -> Result<InputFile> {
+            unimplemented!("not used")
+        }
+
+        fn new_output(&self, _path: &str) -> Result<OutputFile> {
+            unimplemented!("not used")
         }
     }
 }

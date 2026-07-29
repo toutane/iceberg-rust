@@ -208,6 +208,8 @@ pub fn iceberg_catalog_rest::RestCatalog::update_table<'life0, 'async_trait>(&'l
 pub struct iceberg_catalog_rest::RestCatalogBuilder
 impl iceberg_catalog_rest::RestCatalogBuilder
 pub fn iceberg_catalog_rest::RestCatalogBuilder::with_client(self, client: reqwest::async_impl::client::Client) -> Self
+impl iceberg_catalog_rest::RestCatalogBuilder
+pub fn iceberg_catalog_rest::RestCatalogBuilder::with_file_io_runtime(self, io_handle: tokio::runtime::handle::Handle) -> Self
 impl core::default::Default for iceberg_catalog_rest::RestCatalogBuilder
 pub fn iceberg_catalog_rest::RestCatalogBuilder::default() -> Self
 impl core::fmt::Debug for iceberg_catalog_rest::RestCatalogBuilder

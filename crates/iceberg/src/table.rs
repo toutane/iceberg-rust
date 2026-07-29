@@ -153,15 +153,13 @@ impl TableBuilder {
             ));
         };
 
-        let Some(runtime) = runtime else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Runtime must be provided with TableBuilder.runtime()",
-            ));
-        };
-
         let encryption_manager =
             EncryptionManager::from_table_metadata(kms_client.as_ref(), &metadata)?;
+
+        let file_io = match runtime.as_ref() {
+            Some(runtime) => file_io.with_runtime(runtime.clone()),
+            None => file_io,
+        };
 
         let object_cache = if disable_cache {
             Arc::new(ObjectCache::with_disabled_cache(
@@ -203,7 +201,9 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
-    runtime: Runtime,
+    /// Runtime explicitly attached at build time. `None` means "resolve from
+    /// the ambient tokio runtime on demand".
+    runtime: Option<Runtime>,
     encryption_manager: Option<Arc<EncryptionManager>>,
 }
 
@@ -217,6 +217,15 @@ impl Table {
     /// Sets the [`Table`] metadata location and returns an updated instance.
     pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
         self.metadata_location = Some(metadata_location);
+        self
+    }
+
+    /// Sets the runtime this table uses when spawning tasks.
+    pub fn with_runtime(mut self, runtime: Runtime) -> Self {
+        let file_io = self.file_io.with_runtime(runtime.clone());
+        self.object_cache = Arc::new(self.object_cache.with_file_io(file_io.clone()));
+        self.file_io = file_io;
+        self.runtime = Some(runtime);
         self
     }
 
@@ -286,9 +295,13 @@ impl Table {
         MetadataTable::new(self)
     }
 
-    /// Returns the [`Runtime`] for this table.
-    pub(crate) fn runtime(&self) -> &Runtime {
-        &self.runtime
+    /// Returns a resolved [`Runtime`] for this table.
+    ///
+    /// If a runtime was set via [`TableBuilder::runtime`], it is returned.
+    /// Otherwise, this borrows the ambient tokio runtime via
+    /// [`Runtime::current`], which panics if called outside a tokio context.
+    pub(crate) fn runtime(&self) -> Runtime {
+        self.runtime.clone().unwrap_or_else(Runtime::current)
     }
 
     /// Returns the flag indicating whether the `Table` is readonly or not
@@ -313,7 +326,7 @@ impl Table {
 
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
+        ArrowReaderBuilder::new(self.file_io.clone(), self.runtime())
     }
 }
 

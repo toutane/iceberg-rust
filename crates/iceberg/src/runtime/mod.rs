@@ -48,6 +48,26 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
+pub(crate) struct AbortOnDropJoinHandle<T>(task::JoinHandle<T>);
+
+impl<T> Unpin for AbortOnDropJoinHandle<T> {}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T: Send + 'static> Future for AbortOnDropJoinHandle<T> {
+    type Output = crate::Result<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx).map(|r| {
+            r.map_err(|e| Error::new(ErrorKind::Unexpected, "spawned task failed").with_source(e))
+        })
+    }
+}
+
 /// Handle to a single tokio runtime.
 ///
 /// Wraps a [`tokio::runtime::Handle`], which is cheap to clone. The caller is
@@ -66,7 +86,7 @@ impl fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    fn from_tokio_handle(handle: tokio::runtime::Handle) -> Self {
+    pub(crate) fn from_tokio_handle(handle: tokio::runtime::Handle) -> Self {
         Self { handle }
     }
 
@@ -77,6 +97,14 @@ impl RuntimeHandle {
         F::Output: Send + 'static,
     {
         JoinHandle(self.handle.spawn(future))
+    }
+
+    pub(crate) fn spawn_abort_on_drop<F>(&self, future: F) -> AbortOnDropJoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        AbortOnDropJoinHandle(self.handle.spawn(future))
     }
 
     /// Spawn a blocking task.
@@ -134,6 +162,17 @@ impl Runtime {
         Self {
             io: RuntimeHandle::from_tokio_handle(io_runtime.handle().clone()),
             cpu: RuntimeHandle::from_tokio_handle(cpu_runtime.handle().clone()),
+        }
+    }
+
+    /// Create a Runtime with separate tokio runtime handles for IO and CPU work.
+    pub fn new_with_handles(
+        io_handle: tokio::runtime::Handle,
+        cpu_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            io: RuntimeHandle::from_tokio_handle(io_handle),
+            cpu: RuntimeHandle::from_tokio_handle(cpu_handle),
         }
     }
 

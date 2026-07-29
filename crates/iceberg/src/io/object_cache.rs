@@ -95,6 +95,15 @@ impl ObjectCache {
         }
     }
 
+    pub(crate) fn with_file_io(&self, file_io: FileIO) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            file_io,
+            cache_disabled: self.cache_disabled,
+            encryption_manager: self.encryption_manager.clone(),
+        }
+    }
+
     /// Retrieves an Arc [`Manifest`] from the cache
     /// or retrieves one from FileIO and parses it if not present
     pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {

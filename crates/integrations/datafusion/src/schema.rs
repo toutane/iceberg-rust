@@ -28,7 +28,9 @@ use futures::StreamExt;
 use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, Error, ErrorKind, NamespaceIdent, Result, Runtime, TableCreation, TableIdent,
+};
 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
@@ -46,19 +48,17 @@ pub(crate) struct IcebergSchemaProvider {
     /// [`TableProvider`] trait.
     /// Wrapped in Arc to allow sharing across async boundaries in register_table.
     tables: Arc<DashMap<String, Arc<IcebergTableProvider>>>,
+    /// Propagated to every [`IcebergTableProvider`] created by this provider.
+    runtime: Option<Runtime>,
 }
 
 impl IcebergSchemaProvider {
-    /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
-    /// using the given client to fetch and initialize table providers for
-    /// the provided namespace in the Iceberg [`Catalog`].
-    ///
-    /// This method retrieves a list of table names
-    /// attempts to create a table provider for each table name, and
-    /// collects these providers into a `HashMap`.
-    pub(crate) async fn try_new(
+    /// Asynchronously tries to construct a new [`IcebergSchemaProvider`],
+    /// propagating `runtime` to every table provider.
+    pub(crate) async fn try_new_optional_runtime(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
+        runtime: Option<Runtime>,
     ) -> Result<Self> {
         // TODO:
         // Tables and providers should be cached based on table_name
@@ -74,7 +74,14 @@ impl IcebergSchemaProvider {
         let providers = try_join_all(
             table_names
                 .iter()
-                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
+                .map(|name| {
+                    IcebergTableProvider::try_new_optional_runtime(
+                        client.clone(),
+                        namespace.clone(),
+                        name,
+                        runtime.clone(),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -88,6 +95,7 @@ impl IcebergSchemaProvider {
             catalog: client,
             namespace,
             tables,
+            runtime,
         })
     }
 }
@@ -168,6 +176,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let namespace = self.namespace.clone();
         let tables = self.tables.clone();
         let name_clone = name.clone();
+        let runtime = self.runtime.clone();
 
         // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
@@ -185,10 +194,11 @@ impl SchemaProvider for IcebergSchemaProvider {
                     .map_err(to_datafusion_error)?;
 
                 // Create a new table provider using the catalog reference
-                let table_provider = IcebergTableProvider::try_new(
+                let table_provider = IcebergTableProvider::try_new_optional_runtime(
                     catalog.clone(),
                     namespace.clone(),
                     name_clone.clone(),
+                    runtime,
                 )
                 .await
                 .map_err(to_datafusion_error)?;
@@ -310,9 +320,10 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = IcebergSchemaProvider::try_new(Arc::new(catalog), namespace)
-            .await
-            .unwrap();
+        let provider =
+            IcebergSchemaProvider::try_new_optional_runtime(Arc::new(catalog), namespace, None)
+                .await
+                .unwrap();
 
         (provider, temp_dir)
     }
