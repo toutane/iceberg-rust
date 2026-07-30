@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt::{Formatter, Result as FmtResult};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
@@ -26,7 +27,9 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
@@ -34,6 +37,126 @@ use iceberg::table::Table;
 
 use super::scan_planning::{IcebergScanConfig, build_table_scan};
 use crate::to_datafusion_error;
+
+const DEFAULT_FILE_GROUP_DISPLAY_LIMIT: usize = 5;
+const DEFAULT_FILE_DISPLAY_LIMIT: usize = 5;
+
+/// Displays Iceberg file scan tasks using DataFusion's `FileGroupsDisplay`
+/// shape and truncation rules, enriched with Iceberg planning metadata.
+///
+/// The byte fields are planned values, not runtime I/O counters:
+///
+/// - `scan_bytes` is the length of a task's planned byte range.
+/// - `planned_scan_bytes` is the sum of `scan_bytes` for a group or the
+///   complete scan.
+/// - `file_size_bytes` is the size of the complete data file recorded in
+///   Iceberg metadata. It can be larger than `scan_bytes` when a task scans
+///   only part of a file, and can be repeated when several tasks reference
+///   different ranges of the same file.
+///
+/// Actual bytes read at runtime can differ from these values because of file
+/// format metadata reads, pruning, caching, and reader access patterns.
+#[derive(Debug)]
+struct FileTaskGroupsDisplay<'a>(&'a [Arc<[FileScanTask]>]);
+
+impl DisplayAs for FileTaskGroupsDisplay<'_> {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
+        let group_count = self.0.len();
+        let group_label = if group_count == 1 { "group" } else { "groups" };
+        let planned_scan_bytes = self
+            .0
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|task| u128::from(task.length))
+            .sum::<u128>();
+        write!(f, "{{{group_count} {group_label}: [")?;
+
+        let group_limit = match t {
+            DisplayFormatType::Verbose => usize::MAX,
+            DisplayFormatType::Default | DisplayFormatType::TreeRender => {
+                DEFAULT_FILE_GROUP_DISPLAY_LIMIT
+            }
+        };
+        for (group_index, group) in self.0.iter().take(group_limit).enumerate() {
+            if group_index == 0 {
+                writeln!(f)?;
+            } else {
+                writeln!(f, ",")?;
+            }
+            write!(f, "  ")?;
+            FileTaskGroupDisplay(group).fmt_as(t, f)?;
+        }
+        if group_count > group_limit {
+            if group_limit > 0 {
+                writeln!(f, ",")?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "  ...")?;
+        }
+        if group_count > 0 {
+            writeln!(f)?;
+        }
+        write!(f, "]}}, planned_scan_bytes={planned_scan_bytes}")
+    }
+}
+
+#[derive(Debug)]
+struct FileTaskGroupDisplay<'a>(&'a [FileScanTask]);
+
+impl DisplayAs for FileTaskGroupDisplay<'_> {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
+        let planned_scan_bytes = self
+            .0
+            .iter()
+            .map(|task| u128::from(task.length))
+            .sum::<u128>();
+        write!(f, "{{files=[")?;
+        let file_limit = match t {
+            DisplayFormatType::Verbose => usize::MAX,
+            DisplayFormatType::Default | DisplayFormatType::TreeRender => {
+                DEFAULT_FILE_DISPLAY_LIMIT
+            }
+        };
+        for (file_index, task) in self.0.iter().take(file_limit).enumerate() {
+            if file_index == 0 {
+                writeln!(f)?;
+            } else {
+                writeln!(f, ",")?;
+            }
+            write!(f, "    ")?;
+            FileTaskDisplay(task).fmt_as(t, f)?;
+        }
+        if self.0.len() > file_limit {
+            if file_limit > 0 {
+                writeln!(f, ",")?;
+            } else {
+                writeln!(f)?;
+            }
+            write!(f, "    ...")?;
+        }
+        if !self.0.is_empty() {
+            writeln!(f)?;
+            write!(f, "  ")?;
+        }
+        write!(f, "], planned_scan_bytes={planned_scan_bytes}}}")
+    }
+}
+
+#[derive(Debug)]
+struct FileTaskDisplay<'a>(&'a FileScanTask);
+
+impl DisplayAs for FileTaskDisplay<'_> {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
+        let task = self.0;
+        let end = task.start.saturating_add(task.length);
+        write!(
+            f,
+            "{{path={}, range={}..{}, scan_bytes={}, file_size_bytes={}}}",
+            task.data_file_path, task.start, end, task.length, task.file_size_in_bytes,
+        )
+    }
+}
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
@@ -226,11 +349,7 @@ impl ExecutionPlan for IcebergTableScan {
 }
 
 impl DisplayAs for IcebergTableScan {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> FmtResult {
         write!(
             f,
             "IcebergTableScan projection:[{}] predicate:[{}]",
@@ -239,13 +358,8 @@ impl DisplayAs for IcebergTableScan {
                 .map_or(String::from(""), |p| format!("{p}")),
         )?;
         if let Some(file_task_groups) = &self.file_task_groups {
-            let task_count: usize = file_task_groups.iter().map(|group| group.len()).sum();
-            write!(
-                f,
-                " task_groups:[{}] tasks:[{}]",
-                file_task_groups.len(),
-                task_count,
-            )?;
+            write!(f, " file_groups=")?;
+            FileTaskGroupsDisplay(file_task_groups).fmt_as(_t, f)?;
         }
         if let Some(limit) = self.limit {
             write!(f, " limit:[{limit}]")?;
