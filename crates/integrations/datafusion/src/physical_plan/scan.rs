@@ -29,11 +29,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::scan::FileScanTaskStream;
 use iceberg::table::Table;
 
-use super::scan_planning::{EagerScanPlan, IcebergScanConfig, build_table_scan};
-use crate::to_datafusion_error;
+use super::scan_planning::{EagerScanPlan, IcebergScanConfig, lazy_scan_stream};
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
@@ -137,53 +135,17 @@ impl ExecutionPlan for IcebergTableScan {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> = match &self
-            .eager_plan
-        {
-            Some(eager_plan) => {
-                let Some(file_task_group) = eager_plan.task_group(partition) else {
-                    return Err(datafusion::common::DataFusionError::Internal(format!(
-                        "IcebergTableScan partition {partition} does not exist; scan has {} partitions",
-                        eager_plan.partition_count()
-                    )));
-                };
-
-                let tasks: FileScanTaskStream = Box::pin(futures::stream::iter(
-                    (0..file_task_group.len()).map(move |idx| Ok(file_task_group[idx].clone())),
-                ));
-                let stream = eager_plan
-                    .arrow_reader_builder()
-                    // Eager planning lets DataFusion drive scan concurrency via output
-                    // partitions. Match DataFusion's FileStream model, where each
-                    // output partition owns one ScanState; keep one data file in
-                    // flight per output partition here.
-                    // https://github.com/apache/datafusion/blob/ad8e7b7f2babe3fcddc3a4f9b5cd1ac0d1b16ad9/datafusion/datasource/src/file_stream/scan_state.rs#L42-L43
-                    .with_data_file_concurrency_limit(1)
-                    .build()
-                    // TODO: Avoid cloning FileScanTasks here once ArrowReader can accept shared tasks.
-                    .read(tasks)
-                    .map_err(to_datafusion_error)?
-                    .stream()
-                    .map_err(to_datafusion_error);
-
-                Box::pin(stream)
-            }
-            None => {
-                let table = self.table.clone();
-                let scan_config = self.scan_config.clone();
-                let fut = async move {
-                    let table_scan = build_table_scan(&table, &scan_config)?;
-                    let stream = table_scan
-                        .to_arrow()
-                        .await
-                        .map_err(to_datafusion_error)?
-                        .map_err(to_datafusion_error);
-                    Ok::<_, datafusion::common::DataFusionError>(stream)
-                };
-
-                Box::pin(futures::stream::once(fut).try_flatten())
-            }
-        };
+        let stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            match &self.eager_plan {
+                Some(eager_plan) => Box::pin(eager_plan.read(partition)?),
+                None => Box::pin(
+                    futures::stream::once(lazy_scan_stream(
+                        self.table.clone(),
+                        self.scan_config.clone(),
+                    ))
+                    .try_flatten(),
+                ),
+            };
 
         // Apply a scan-partition bound if specified. In eager planning this is only
         // a per-partition bound. The optimized DataFusion plan enforces the final

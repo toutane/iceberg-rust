@@ -17,13 +17,14 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::error::Result as DFResult;
 use datafusion::prelude::Expr;
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
-use iceberg::scan::{FileScanTask, TableScan};
+use iceberg::scan::{FileScanTask, FileScanTaskStream, TableScan};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -101,9 +102,40 @@ impl EagerScanPlan {
         self.task_groups.iter().map(|group| group.len()).sum()
     }
 
-    /// Returns the task group assigned to `partition`, or `None` if out of range.
-    pub(crate) fn task_group(&self, partition: usize) -> Option<Arc<[FileScanTask]>> {
-        self.task_groups.get(partition).cloned()
+    /// Reads the task group assigned to `partition`.
+    ///
+    /// Counterpart to [`lazy_scan_stream`]. Both derive their reader from a
+    /// [`TableScan`] built by [`build_table_scan`], which is what keeps the eager
+    /// and lazy paths' reader settings from drifting apart.
+    pub(crate) fn read(
+        &self,
+        partition: usize,
+    ) -> DFResult<impl Stream<Item = DFResult<RecordBatch>> + Send + use<>> {
+        let Some(file_task_group) = self.task_groups.get(partition).cloned() else {
+            return Err(datafusion::common::DataFusionError::Internal(format!(
+                "IcebergTableScan partition {partition} does not exist; scan has {} partitions",
+                self.partition_count()
+            )));
+        };
+
+        let tasks: FileScanTaskStream = Box::pin(futures::stream::iter(
+            (0..file_task_group.len()).map(move |idx| Ok(file_task_group[idx].clone())),
+        ));
+
+        Ok(self
+            .arrow_reader_builder()
+            // Eager planning lets DataFusion drive scan concurrency via output
+            // partitions. Match DataFusion's FileStream model, where each
+            // output partition owns one ScanState; keep one data file in
+            // flight per output partition here.
+            // https://github.com/apache/datafusion/blob/ad8e7b7f2babe3fcddc3a4f9b5cd1ac0d1b16ad9/datafusion/datasource/src/file_stream/scan_state.rs#L42-L43
+            .with_data_file_concurrency_limit(1)
+            .build()
+            // TODO: Avoid cloning FileScanTasks here once ArrowReader can accept shared tasks.
+            .read(tasks)
+            .map_err(to_datafusion_error)?
+            .stream()
+            .map_err(to_datafusion_error))
     }
 
     /// Returns an [`ArrowReaderBuilder`] configured for this scan.
@@ -113,9 +145,27 @@ impl EagerScanPlan {
     /// settings (batch size, row group filtering, row selection) sourced from the
     /// same place as the lazy path's `TableScan::to_arrow`, so the two scan paths
     /// cannot silently drift apart.
-    pub(crate) fn arrow_reader_builder(&self) -> ArrowReaderBuilder {
+    fn arrow_reader_builder(&self) -> ArrowReaderBuilder {
         self.table_scan.arrow_reader_builder()
     }
+}
+
+/// Plans and reads the whole scan at execute time, in a single output partition.
+///
+/// Counterpart to [`plan_eager_scan`] + [`EagerScanPlan::read`]: both build their
+/// [`TableScan`] through [`build_table_scan`], so the snapshot, projection,
+/// predicate and reader settings are sourced from one place.
+pub(crate) async fn lazy_scan_stream(
+    table: Table,
+    scan_config: IcebergScanConfig,
+) -> DFResult<impl Stream<Item = DFResult<RecordBatch>> + Send + use<>> {
+    let table_scan = build_table_scan(&table, &scan_config)?;
+
+    Ok(table_scan
+        .to_arrow()
+        .await
+        .map_err(to_datafusion_error)?
+        .map_err(to_datafusion_error))
 }
 
 pub(crate) async fn plan_eager_scan(
@@ -181,10 +231,12 @@ fn group_file_scan_tasks_round_robin(
     groups
 }
 
-pub(crate) fn build_table_scan(
-    table: &Table,
-    scan_config: &IcebergScanConfig,
-) -> DFResult<TableScan> {
+/// Builds the [`TableScan`] for a DataFusion scan.
+///
+/// Private on purpose: keeping this the module's only `TableScan` constructor is
+/// what makes it impossible to build a scan, or a reader derived from one, outside
+/// this module. Both the eager and the lazy path go through it.
+fn build_table_scan(table: &Table, scan_config: &IcebergScanConfig) -> DFResult<TableScan> {
     let builder = match scan_config.snapshot_id {
         Some(id) => table.scan().snapshot_id(id),
         None => table.scan(),
